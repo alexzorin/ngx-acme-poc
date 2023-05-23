@@ -1,0 +1,11 @@
+{
+    "C_Cpp.default.includePath": [
+        "/opt/homebrew/include",
+        "/opt/homebrew/Cellar/openssl@3/3.1.0/include",
+        "/Users/alex/Downloads/nginx/src/**",
+        "/Users/alex/Downloads/nginx/objs/**",
+    ],
+    "files.associations": {
+        "ngx_http.h": "c"
+    }
+}
