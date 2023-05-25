@@ -8,6 +8,7 @@ typedef struct
 {
     ngx_str_t cert;
     ngx_str_t cert_key;
+    char *set_servers_request;
 } ngx_http_acme_conf_t;
 
 static ngx_http_acme_conf_t *acme_ctx = NULL;
@@ -30,6 +31,10 @@ static ngx_int_t ngx_http_acme_cert_key_variable_get_handler(ngx_http_request_t 
 static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle);
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool);
 
+// Snakeoil key and certificate is temporarily used as the default value of $acme_certificate_key
+// and $acme_certificate, respectively, before the real value is obtained from the ACME client.
+// Instead of doing this, the module potentially block the configuration process until the values
+// are bootstrapped.
 static const char SNAKEOIL_KEY[] = "-----BEGIN EC PRIVATE KEY-----\n"
                                    "MHcCAQEEICPT+ahCJ7N6tXzpWFHiCiHWF/gEcjNc6/GUdSFi0YV0oAoGCCqGSM49\n"
                                    "AwEHoUQDQgAELPBER10XsjGV35+p0cKdLLkMaY8+QEsEVb6+h3Mz1vufmGKj34y9\n"
@@ -106,7 +111,6 @@ ngx_http_acme_create_conf(ngx_conf_t *cf)
     {
         return NULL;
     }
-
     cln->handler = ngx_http_acme_cleanup;
     cln->data = conf;
 
@@ -116,81 +120,84 @@ ngx_http_acme_create_conf(ngx_conf_t *cf)
 static char *
 ngx_http_acme(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-    // ngx_http_acme_conf_t *acme_conf = conf;
-
+    // When the `acme on;` directive appears in a server block, the module
+    // will set $ssl_certificate and $ssl_certificate_key to be resolved
+    // using the $acme_* variables of the same name managed by this module.
     ngx_http_ssl_srv_conf_t *ssl_conf;
     ngx_http_complex_value_t *cv;
     ngx_http_compile_complex_value_t ccv;
 
     ngx_str_t *cert, *key;
 
+    // The server block must be SSL-enabled.
     ssl_conf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_ssl_module);
-    if (ssl_conf)
+    if (!ssl_conf)
     {
-        ngx_log_error(NGX_LOG_ERR, cf->log, 0, "In ssl_conf!");
-
-        ssl_conf->certificates = ngx_array_create(cf->pool, 1, sizeof(ngx_str_t));
-        if (ssl_conf->certificates == NULL)
-        {
-            return NGX_CONF_ERROR;
-        }
-        ((ngx_str_t *)ssl_conf->certificates->elts)[0] = (ngx_str_t)ngx_string("data:$acme_certificate");
-        cert = ssl_conf->certificates->elts;
-
-        ssl_conf->certificate_keys = ngx_array_create(cf->pool, 1, sizeof(ngx_str_t));
-        if (ssl_conf->certificate_keys == NULL)
-        {
-            return NGX_CONF_ERROR;
-        }
-        ((ngx_str_t *)ssl_conf->certificate_keys->elts)[0] = (ngx_str_t)ngx_string("data:$acme_certificate_key");
-        key = ssl_conf->certificate_keys->elts;
-
-        ssl_conf->certificate_values = ngx_array_create(cf->pool, 1,
-                                                        sizeof(ngx_http_complex_value_t));
-        if (ssl_conf->certificate_values == NULL)
-        {
-            return NGX_CONF_ERROR;
-        }
-        ssl_conf->certificate_key_values = ngx_array_create(cf->pool, 1,
-                                                            sizeof(ngx_http_complex_value_t));
-        if (ssl_conf->certificate_key_values == NULL)
-        {
-            return NGX_CONF_ERROR;
-        }
-
-        cv = ngx_array_push(ssl_conf->certificate_values);
-        if (cv == NULL)
-        {
-            return NGX_CONF_ERROR;
-        }
-        ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
-        ccv.cf = cf;
-        ccv.value = &cert[0];
-        ccv.complex_value = cv;
-        ccv.zero = 1;
-        if (ngx_http_compile_complex_value(&ccv) != NGX_OK)
-        {
-            return NGX_CONF_ERROR;
-        }
-
-        cv = ngx_array_push(ssl_conf->certificate_key_values);
-        if (cv == NULL)
-        {
-            return NGX_CONF_ERROR;
-        }
-        ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
-        ccv.cf = cf;
-        ccv.value = &key[0];
-        ccv.complex_value = cv;
-        ccv.zero = 1;
-        if (ngx_http_compile_complex_value(&ccv) != NGX_OK)
-        {
-            return NGX_CONF_ERROR;
-        }
-
-        ngx_log_error(NGX_LOG_ERR, cf->log, 0, "In end of ssl_conf!");
+        ngx_log_error(NGX_LOG_ERR, cf->log, 0, "the acme directive is only allowed in SSL contexts");
+        return NGX_CONF_ERROR;
     }
 
+    // Set ssl_certificate and ssl_certificate key.
+    ssl_conf->certificates = ngx_array_create(cf->pool, 1, sizeof(ngx_str_t));
+    if (ssl_conf->certificates == NULL)
+    {
+        return NGX_CONF_ERROR;
+    }
+    ((ngx_str_t *)ssl_conf->certificates->elts)[0] = (ngx_str_t)ngx_string("data:$acme_certificate");
+    cert = ssl_conf->certificates->elts;
+
+    ssl_conf->certificate_keys = ngx_array_create(cf->pool, 1, sizeof(ngx_str_t));
+    if (ssl_conf->certificate_keys == NULL)
+    {
+        return NGX_CONF_ERROR;
+    }
+    ((ngx_str_t *)ssl_conf->certificate_keys->elts)[0] = (ngx_str_t)ngx_string("data:$acme_certificate_key");
+    key = ssl_conf->certificate_keys->elts;
+
+    // Variable support in $ssl_certificate[_key] requires use of ngx_http_complex_value_t,
+    // so here we set those up using the contents of $ssl_certificate and $ssl_certificate_key.
+    ssl_conf->certificate_values = ngx_array_create(cf->pool, 1,
+                                                    sizeof(ngx_http_complex_value_t));
+    if (ssl_conf->certificate_values == NULL)
+    {
+        return NGX_CONF_ERROR;
+    }
+    ssl_conf->certificate_key_values = ngx_array_create(cf->pool, 1,
+                                                        sizeof(ngx_http_complex_value_t));
+    if (ssl_conf->certificate_key_values == NULL)
+    {
+        return NGX_CONF_ERROR;
+    }
+
+    cv = ngx_array_push(ssl_conf->certificate_values);
+    if (cv == NULL)
+    {
+        return NGX_CONF_ERROR;
+    }
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+    ccv.cf = cf;
+    ccv.value = &cert[0];
+    ccv.complex_value = cv;
+    ccv.zero = 1;
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+
+    cv = ngx_array_push(ssl_conf->certificate_key_values);
+    if (cv == NULL)
+    {
+        return NGX_CONF_ERROR;
+    }
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+    ccv.cf = cf;
+    ccv.value = &key[0];
+    ccv.complex_value = cv;
+    ccv.zero = 1;
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
     return NGX_CONF_OK;
 }
 
@@ -199,7 +206,10 @@ ngx_http_acme_init_conf(ngx_conf_t *cf, void *conf)
 {
     ngx_http_acme_conf_t *acme_conf = conf;
 
+    // Here we are making the module conf available as a static global
+    // for the workers.
     acme_ctx = acme_conf;
+
     return NGX_CONF_OK;
 }
 
@@ -211,7 +221,44 @@ ngx_http_acme_cleanup(void *data)
 static ngx_int_t
 ngx_http_acme_postconfiguration(ngx_conf_t *cf)
 {
-    // ngx_http_acme_conf_t *acme_conf = cf;
+    // In postconfiguration, we compile every server block's server_name(s)
+    // and store it as a JSON string that workers will use to initialize the
+    // ACME client to the state of the server configuration.
+    ngx_http_core_main_conf_t *cmcf;
+    ngx_uint_t i, j;
+    ngx_http_core_srv_conf_t **cscfp;
+    ngx_http_core_srv_conf_t *cscf;
+    ngx_http_server_name_t *name;
+
+    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+    cscfp = cmcf->servers.elts;
+
+    cJSON *json_root = cJSON_CreateObject();
+    cJSON *json_servers_array = cJSON_CreateArray();
+    cJSON_AddItemToObject(json_root, "servers", json_servers_array);
+
+    for (i = 0; i < cmcf->servers.nelts; i++)
+    {
+        cscf = cscfp[i]->ctx->srv_conf[ngx_http_core_module.ctx_index];
+
+        cJSON *json_server = cJSON_CreateObject();
+        cJSON *json_server_names_array = cJSON_CreateArray();
+        cJSON_AddItemToObject(json_server, "server_names", json_server_names_array);
+
+        name = cscf->server_names.elts;
+        for (j = 0; j < cscf->server_names.nelts; j++)
+        {
+
+            cJSON *json_server_name = ngx_str_to_cJSON(name[j].name, cf->pool);
+            cJSON_AddItemToArray(json_server_names_array, json_server_name);
+        }
+
+        cJSON_AddItemToArray(json_servers_array, json_server);
+    }
+
+    acme_ctx->set_servers_request = cJSON_Print(json_root);
+    cJSON_Delete(json_root);
+
     return NGX_OK;
 }
 
@@ -265,56 +312,18 @@ ngx_http_acme_cert_key_variable_get_handler(ngx_http_request_t *r, ngx_http_vari
 
 static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle)
 {
-    ngx_http_core_main_conf_t *cmcf;
-    ngx_uint_t i, j;
-    ngx_http_core_srv_conf_t **cscfp;
-    ngx_http_core_srv_conf_t *cscf;
-    ngx_http_server_name_t *name;
-
-    // Retrieve the HTTP core main configuration
-    cmcf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_core_module);
-    cscfp = cmcf->servers.elts;
-
-    cJSON *json_root = cJSON_CreateObject();
-    cJSON *json_servers_array = cJSON_CreateArray();
-    cJSON_AddItemToObject(json_root, "servers", json_servers_array);
-
-    for (i = 0; i < cmcf->servers.nelts; i++)
-    {
-        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "In a server block");
-        cscf = cscfp[i]->ctx->srv_conf[ngx_http_core_module.ctx_index];
-
-        cJSON *json_server = cJSON_CreateObject();
-        cJSON *json_server_names_array = cJSON_CreateArray();
-        cJSON_AddItemToObject(json_server, "server_names", json_server_names_array);
-
-        // Log each server_name in cscf
-        name = cscf->server_names.elts;
-        for (j = 0; j < cscf->server_names.nelts; j++)
-        {
-            ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "Server name: %V", &name[j].name);
-
-            cJSON *json_server_name = ngx_str_to_cJSON(name[j].name, cycle->pool);
-            cJSON_AddItemToArray(json_server_names_array, json_server_name);
-        }
-
-        cJSON_AddItemToArray(json_servers_array, json_server);
-    }
-
-    char *asJSON = cJSON_Print(json_root);
-    ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "Request: %s", asJSON);
-    free(asJSON);
-
     return NGX_OK;
 }
 
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool)
 {
+    // An ngx_str_t may or may not be NULL-terminated. If it is, that's easy.
     if (str.data[str.len] == '\0')
     {
         return cJSON_CreateStringReference((const char *)str.data);
     }
 
+    // Otherwise, we need to copy the string into a NULL-terminated buffer.
     u_char *data = ngx_palloc(pool, str.len + 1);
     ngx_memcpy(data, str.data, str.len);
     str.data[str.len] = '\0';
