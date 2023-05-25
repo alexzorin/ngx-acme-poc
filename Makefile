@@ -24,3 +24,4 @@ run:
 clean:
 	cd $(NGINX_SRC_DIR) && make clean || true
 	rm -f ngx_http_acme_module.so
+	truncate -s 0 $(NGINX_INSTALL_DIR)/error.log

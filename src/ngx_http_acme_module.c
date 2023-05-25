@@ -6,9 +6,19 @@
 
 typedef struct
 {
+    ngx_pool_t *pool;
+
     ngx_str_t cert;
     ngx_str_t cert_key;
+
     char *set_servers_request;
+
+    ngx_event_t acme_ev;
+    ngx_peer_connection_t acme_pc;
+
+    struct sockaddr_in acme_addr;
+
+    ngx_connection_t dummy_conn;
 } ngx_http_acme_conf_t;
 
 static ngx_http_acme_conf_t *acme_ctx = NULL;
@@ -29,6 +39,7 @@ static ngx_int_t ngx_http_acme_cert_key_variable_get_handler(ngx_http_request_t 
                                                              ngx_http_variable_value_t *v,
                                                              uintptr_t data);
 static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle);
+static void ngx_http_acme_ev_begin(ngx_event_t *event);
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool);
 
 // Snakeoil key and certificate is temporarily used as the default value of $acme_certificate_key
@@ -105,6 +116,9 @@ ngx_http_acme_create_conf(ngx_conf_t *cf)
     conf->cert.len = sizeof(SNAKEOIL_CERT) - 1;
     conf->cert_key.data = (u_char *)SNAKEOIL_KEY;
     conf->cert_key.len = sizeof(SNAKEOIL_KEY) - 1;
+
+    // We need this dummy connection to be able to use ngx_add_timer.
+    conf->dummy_conn.fd = (ngx_socket_t)-1;
 
     cln = ngx_pool_cleanup_add(cf->pool, 0);
     if (cln == NULL)
@@ -259,6 +273,12 @@ ngx_http_acme_postconfiguration(ngx_conf_t *cf)
     acme_ctx->set_servers_request = cJSON_Print(json_root);
     cJSON_Delete(json_root);
 
+    // Also initialize some other static data we'll be using
+    ngx_memzero(&acme_ctx->acme_addr, sizeof(acme_ctx->acme_addr));
+    acme_ctx->acme_addr.sin_family = AF_INET;
+    acme_ctx->acme_addr.sin_port = htons(41934);
+    acme_ctx->acme_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
     return NGX_OK;
 }
 
@@ -312,7 +332,52 @@ ngx_http_acme_cert_key_variable_get_handler(ngx_http_request_t *r, ngx_http_vari
 
 static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle)
 {
+    // We are now in the worker process and everything is ready to begin communicating
+    // with the ACME client.
+    //
+    // We will kick this off with two requests to the ACME client:
+    // 1. Set the servers that this worker will be serving.
+    // 2. Get the available set of certificates that we can use in this worker.
+    //
+    // We will use the nginx event loop to perform the work.
+    ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "Enter ngx_http_acme_init_process");
+
+    acme_ctx->pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, ngx_cycle->log);
+
+    acme_ctx->acme_ev.handler = ngx_http_acme_ev_begin;
+    acme_ctx->acme_ev.timer_set = 0;
+    acme_ctx->acme_ev.log = cycle->log;
+    acme_ctx->acme_ev.data = &acme_ctx->dummy_conn;
+
+    ngx_add_timer(&acme_ctx->acme_ev, 1000);
+
+    ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "Exit ngx_http_acme_init_process");
+
     return NGX_OK;
+}
+
+static void ngx_http_acme_ev_begin(ngx_event_t *event)
+{
+    ngx_log_error(NGX_LOG_ERR, event->log, 0, "ngx_http_acme_ev_begin");
+    // This is the first event in the ACME client workflow.
+    // We will bring up the connection to the ACME client.
+
+    ngx_peer_connection_t *pc = &acme_ctx->acme_pc;
+    pc->get = ngx_event_get_peer;
+    pc->log = event->log;
+    pc->log_error = NGX_ERROR_ERR;
+    pc->connection = NULL;
+    pc->cached = 0;
+    pc->sockaddr = (struct sockaddr *)&acme_ctx->acme_addr;
+    pc->socklen = sizeof(struct sockaddr_in);
+    ngx_str_t pc_name = (ngx_str_t)ngx_string("localhost");
+    pc->name = &pc_name;
+
+    // int rc = ngx_event_connect_peer(pc);
+    // if (rc == NGX_ERROR || rc == NGX_DECLINED) {
+    //     ngx_log_error(NGX_LOG_ERR, event->log, 0, "ngx_event_connect_peer failed");
+    //     return;
+    // }
 }
 
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool)
