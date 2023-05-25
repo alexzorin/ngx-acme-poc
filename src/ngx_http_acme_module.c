@@ -2,6 +2,7 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <ngx_event_connect.h>
+#include "cJSON.h"
 
 typedef struct
 {
@@ -27,6 +28,7 @@ static ngx_int_t ngx_http_acme_cert_key_variable_get_handler(ngx_http_request_t 
                                                              ngx_http_variable_value_t *v,
                                                              uintptr_t data);
 static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle);
+cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool);
 
 static const char SNAKEOIL_KEY[] = "-----BEGIN EC PRIVATE KEY-----\n"
                                    "MHcCAQEEICPT+ahCJ7N6tXzpWFHiCiHWF/gEcjNc6/GUdSFi0YV0oAoGCCqGSM49\n"
@@ -271,20 +273,52 @@ static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle)
 
     // Retrieve the HTTP core main configuration
     cmcf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_core_module);
-
     cscfp = cmcf->servers.elts;
+
+    cJSON *json_root = cJSON_CreateObject();
+    cJSON *json_servers_array = cJSON_CreateArray();
+    cJSON_AddItemToObject(json_root, "servers", json_servers_array);
 
     for (i = 0; i < cmcf->servers.nelts; i++)
     {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "In a server block");
         cscf = cscfp[i]->ctx->srv_conf[ngx_http_core_module.ctx_index];
+
+        cJSON *json_server = cJSON_CreateObject();
+        cJSON *json_server_names_array = cJSON_CreateArray();
+        cJSON_AddItemToObject(json_server, "server_names", json_server_names_array);
 
         // Log each server_name in cscf
         name = cscf->server_names.elts;
         for (j = 0; j < cscf->server_names.nelts; j++)
         {
             ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "Server name: %V", &name[j].name);
+
+            cJSON *json_server_name = ngx_str_to_cJSON(name[j].name, cycle->pool);
+            cJSON_AddItemToArray(json_server_names_array, json_server_name);
         }
+
+        cJSON_AddItemToArray(json_servers_array, json_server);
     }
 
+    char *asJSON = cJSON_Print(json_root);
+    ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "Request: %s", asJSON);
+    free(asJSON);
+
     return NGX_OK;
+}
+
+cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool)
+{
+    if (str.data[str.len] == '\0')
+    {
+        return cJSON_CreateStringReference((const char *)str.data);
+    }
+
+    u_char *data = ngx_palloc(pool, str.len + 1);
+    ngx_memcpy(data, str.data, str.len);
+    str.data[str.len] = '\0';
+    cJSON *json = cJSON_CreateString((const char *)data);
+    ngx_pfree(pool, data);
+    return json;
 }
