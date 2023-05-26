@@ -3,28 +3,33 @@
 #include <ngx_http.h>
 #include <ngx_event_connect.h>
 #include "cJSON.h"
+#include "llhttp/llhttp.h"
 
 typedef struct
 {
-    ngx_pool_t *pool;
+    ngx_pool_t *pool; // Memory allocator we'll use for the module (available after worker init)
+    ngx_log_t *log;   // Logger for the module
 
-    ngx_str_t cert;
-    ngx_str_t cert_key;
+    ngx_str_t cert;     // Temporary storage for the certificate from the ACME client
+    ngx_str_t cert_key; // Temporary storage for the certificate key from the ACME client
 
-    ngx_str_t set_servers;
+    ngx_str_t set_servers; // The HTTP request body to send to the ACME client to /set-servers
+    ngx_str_t get_certs;   // The HTTP request body to the ACME client for /certificates
 
-    ngx_event_t acme_ev;
-    ngx_peer_connection_t acme_pc;
+    ngx_str_t *current_request; // The request type we're working on (set_servers or get_certs)
 
-    struct sockaddr_in acme_addr;
+    ngx_connection_t dummy_conn; // Required by ngx_add_timer
 
-    ngx_connection_t dummy_conn;
+    ngx_event_t acme_ev; // The event that triggers talking to the ACME client (timer)
 
-    ngx_connection_t *acme_conn;
-    ngx_buf_t send;
-    ngx_buf_t recv;
-    ngx_buf_t body;
+    llhttp_settings_t parser_settings; // HTTP parser settings
+    llhttp_t parser;                   // The HTTP parser for talking to the ACME client
 
+    struct sockaddr_in acme_addr;  // The address we dial to talk to the ACME client
+    ngx_peer_connection_t acme_pc; // The connection to the ACME client
+    ngx_connection_t *acme_conn;   // acme->pc.connection
+    ngx_buf_t send;                // The write buffer for acme_conn
+    ngx_buf_t recv;                // The read buffer for acme_conn
 } ngx_http_acme_conf_t;
 
 static ngx_http_acme_conf_t *acme_ctx = NULL;
@@ -46,9 +51,12 @@ static ngx_int_t ngx_http_acme_cert_key_variable_get_handler(ngx_http_request_t 
                                                              uintptr_t data);
 static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle);
 static void ngx_http_acme_ev_begin(ngx_event_t *event);
-static void ngx_http_acme_ev_set_servers_send_handler(ngx_event_t *event);
-static void ngx_http_acme_ev_set_servers_recv_handler(ngx_event_t *event);
+static void ngx_http_acme_ev_request_send_handler(ngx_event_t *event);
+static void ngx_http_acme_ev_request_recv_handler(ngx_event_t *event);
 static void ngx_http_acme_ev_empty_handler(ngx_event_t *event);
+static void ngx_http_acme_init_parser();
+static int ngx_http_acme_http_on_message_complete(llhttp_t *http);
+static void ngx_http_acme_parse_http_response();
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool);
 
 // Snakeoil key and certificate is temporarily used as the default value of $acme_certificate_key
@@ -282,6 +290,7 @@ ngx_http_acme_postconfiguration(ngx_conf_t *cf)
     set_servers = (char *)cJSON_Print(json_root);
     cJSON_Delete(json_root);
 
+    // Set up the POST /set-servers request
     set_servers_len = ((strlen(set_servers) + ngx_pagesize - 1) / ngx_pagesize) * ngx_pagesize;
     acme_ctx->set_servers.len = set_servers_len;
     acme_ctx->set_servers.data = ngx_pcalloc(cf->pool, set_servers_len);
@@ -299,11 +308,24 @@ ngx_http_acme_postconfiguration(ngx_conf_t *cf)
     free(set_servers);
     acme_ctx->set_servers.len = strlen((char *)acme_ctx->set_servers.data);
 
+    // Set up the GET /certificates request
+    acme_ctx->get_certs.len = ngx_pagesize;
+    acme_ctx->get_certs.data = ngx_pcalloc(cf->pool, acme_ctx->get_certs.len);
+    if (acme_ctx->get_certs.data == NULL)
+    {
+        return NGX_ERROR;
+    }
+    ngx_sprintf(acme_ctx->get_certs.data,
+                "GET /certificates HTTP/1.0\r\nAccept: application/json\r\n\r\n");
+
     // Also initialize some other static data we'll be using
+    ngx_memzero(&acme_ctx->parser, sizeof(llhttp_t));
     ngx_memzero(&acme_ctx->acme_addr, sizeof(acme_ctx->acme_addr));
     acme_ctx->acme_addr.sin_family = AF_INET;
     acme_ctx->acme_addr.sin_port = htons(41934);
     acme_ctx->acme_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    acme_ctx->current_request = &acme_ctx->set_servers;
 
     return NGX_OK;
 }
@@ -348,7 +370,6 @@ static ngx_int_t
 ngx_http_acme_cert_key_variable_get_handler(ngx_http_request_t *r, ngx_http_variable_value_t *v,
                                             uintptr_t data)
 {
-    // Get the server_name from the ngx_http_request_t
     v->data = acme_ctx->cert_key.data;
     v->no_cacheable = 1;
     v->not_found = 0;
@@ -369,6 +390,9 @@ static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle)
     ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "Enter ngx_http_acme_init_process");
 
     acme_ctx->pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, ngx_cycle->log);
+    acme_ctx->log = ngx_cycle->log;
+
+    ngx_http_acme_init_parser();
 
     acme_ctx->acme_ev.handler = ngx_http_acme_ev_begin;
     acme_ctx->acme_ev.timer_set = 0;
@@ -413,8 +437,8 @@ static void ngx_http_acme_ev_begin(ngx_event_t *event)
     c->read->log = c->log;
     c->write->log = c->log;
     c->idle = 1;
-    c->write->handler = ngx_http_acme_ev_set_servers_send_handler;
-    c->read->handler = ngx_http_acme_ev_set_servers_recv_handler;
+    c->write->handler = ngx_http_acme_ev_request_send_handler;
+    c->read->handler = ngx_http_acme_ev_request_recv_handler;
 
     acme_ctx->acme_conn = c;
 
@@ -424,14 +448,14 @@ static void ngx_http_acme_ev_begin(ngx_event_t *event)
     }
 }
 
-static void ngx_http_acme_ev_set_servers_send_handler(ngx_event_t *event)
+static void ngx_http_acme_ev_request_send_handler(ngx_event_t *event)
 {
     ssize_t size = 0;
 
-    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_set_servers_send_handler");
+    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_request_send_handler");
 
-    acme_ctx->send.pos = (u_char *)acme_ctx->set_servers.data;
-    acme_ctx->send.last = acme_ctx->send.pos + acme_ctx->set_servers.len;
+    acme_ctx->send.pos = (u_char *)acme_ctx->current_request->data;
+    acme_ctx->send.last = acme_ctx->send.pos + acme_ctx->current_request->len;
     while (acme_ctx->send.pos < acme_ctx->send.last)
     {
         size = acme_ctx->acme_conn->send(
@@ -454,25 +478,28 @@ static void ngx_http_acme_ev_set_servers_send_handler(ngx_event_t *event)
 
     acme_ctx->acme_conn->write->handler = ngx_http_acme_ev_empty_handler;
 
-    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_set_servers_send_handler");
+    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_request_send_handler");
 }
 
-static void ngx_http_acme_ev_set_servers_recv_handler(ngx_event_t *event)
+static void ngx_http_acme_ev_request_recv_handler(ngx_event_t *event)
 {
     ssize_t n, size;
     u_char *resized_buf;
 
-    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_set_servers_recv_handler");
+    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_request_recv_handler");
 
     ngx_buf_t *recv = &acme_ctx->recv;
-    recv->start = ngx_pcalloc(acme_ctx->pool, ngx_pagesize);
     if (recv->start == NULL)
     {
-        ngx_log_error(NGX_LOG_ERR, event->log, 0, "ngx_pcalloc failed");
-        return;
+        recv->start = ngx_pcalloc(acme_ctx->pool, ngx_pagesize);
+        if (recv->start == NULL)
+        {
+            ngx_log_error(NGX_LOG_ERR, event->log, 0, "ngx_pcalloc failed");
+            return;
+        }
+        recv->last = recv->pos = recv->start;
+        recv->end = recv->start + ngx_pagesize;
     }
-    recv->last = recv->pos = recv->start;
-    recv->end = recv->start + ngx_pagesize;
 
     while (1)
     {
@@ -509,19 +536,65 @@ static void ngx_http_acme_ev_set_servers_recv_handler(ngx_event_t *event)
         else
         {
             acme_ctx->acme_conn->error = 1;
-            ngx_log_error(NGX_LOG_ERR, event->log, 0, "Ext ngx_http_acme_ev_set_servers_recv_handler in error");
+            ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_request_recv_handler in error");
             return;
         }
     }
 
+    ngx_http_acme_parse_http_response();
+
     acme_ctx->acme_conn->read->handler = ngx_http_acme_ev_empty_handler;
-    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_set_servers_recv_handler");
+    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_request_recv_handler");
 }
 
 static void ngx_http_acme_ev_empty_handler(ngx_event_t *event)
 {
     ngx_log_error(NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_empty_handler");
     ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_empty_handler");
+}
+
+static void ngx_http_acme_init_parser()
+{
+    llhttp_settings_init(&acme_ctx->parser_settings);
+    acme_ctx->parser_settings.on_message_complete = ngx_http_acme_http_on_message_complete;
+    llhttp_init(&acme_ctx->parser, HTTP_RESPONSE, &acme_ctx->parser_settings);
+}
+
+static int ngx_http_acme_http_on_message_complete(llhttp_t *http)
+{
+    ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Enter ngx_http_acme_http_on_message_complete");
+
+    if (acme_ctx->current_request == &acme_ctx->set_servers)
+    {
+        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "set-servers response: %d",
+                      acme_ctx->parser.status_code);
+        return 0;
+    }
+    else if (acme_ctx->current_request == &acme_ctx->get_certs)
+    {
+        return 0;
+    }
+
+    ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Exit ngx_http_acme_http_on_message_complete");
+    return 0;
+}
+
+static void ngx_http_acme_parse_http_response()
+{
+    ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Enter ngx_http_acme_parse_http_response");
+
+    char *buf;
+    enum llhttp_errno err;
+
+    buf = (char *)acme_ctx->recv.pos;
+
+    err = llhttp_execute(&acme_ctx->parser, buf, acme_ctx->recv.last - acme_ctx->recv.pos);
+    if (err != HPE_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "llhttp_execute failed: %s", llhttp_errno_name(err));
+        return;
+    }
+    ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Exit ngx_http_acme_parse_http_response");
 }
 
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool)
