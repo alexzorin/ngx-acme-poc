@@ -19,6 +19,12 @@ typedef struct
     struct sockaddr_in acme_addr;
 
     ngx_connection_t dummy_conn;
+
+    ngx_connection_t *acme_conn;
+    ngx_buf_t send;
+    ngx_buf_t recv;
+    ngx_buf_t body;
+
 } ngx_http_acme_conf_t;
 
 static ngx_http_acme_conf_t *acme_ctx = NULL;
@@ -40,6 +46,9 @@ static ngx_int_t ngx_http_acme_cert_key_variable_get_handler(ngx_http_request_t 
                                                              uintptr_t data);
 static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle);
 static void ngx_http_acme_ev_begin(ngx_event_t *event);
+static void ngx_http_acme_ev_set_servers_send_handler(ngx_event_t *event);
+static void ngx_http_acme_ev_set_servers_recv_handler(ngx_event_t *event);
+static void ngx_http_acme_ev_empty_handler(ngx_event_t *event);
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool);
 
 // Snakeoil key and certificate is temporarily used as the default value of $acme_certificate_key
@@ -262,7 +271,6 @@ ngx_http_acme_postconfiguration(ngx_conf_t *cf)
         name = cscf->server_names.elts;
         for (j = 0; j < cscf->server_names.nelts; j++)
         {
-
             cJSON *json_server_name = ngx_str_to_cJSON(name[j].name, cf->pool);
             cJSON_AddItemToArray(json_server_names_array, json_server_name);
         }
@@ -349,7 +357,7 @@ static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle)
     acme_ctx->acme_ev.log = cycle->log;
     acme_ctx->acme_ev.data = &acme_ctx->dummy_conn;
 
-    ngx_add_timer(&acme_ctx->acme_ev, 1000);
+    ngx_add_timer(&acme_ctx->acme_ev, 0);
 
     ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "Exit ngx_http_acme_init_process");
 
@@ -373,11 +381,85 @@ static void ngx_http_acme_ev_begin(ngx_event_t *event)
     ngx_str_t pc_name = (ngx_str_t)ngx_string("localhost");
     pc->name = &pc_name;
 
-    // int rc = ngx_event_connect_peer(pc);
-    // if (rc == NGX_ERROR || rc == NGX_DECLINED) {
-    //     ngx_log_error(NGX_LOG_ERR, event->log, 0, "ngx_event_connect_peer failed");
-    //     return;
-    // }
+    int rc = ngx_event_connect_peer(pc);
+    if (rc == NGX_ERROR || rc == NGX_DECLINED)
+    {
+        ngx_log_error(NGX_LOG_ERR, event->log, 0, "ngx_event_connect_peer failed");
+        return;
+    }
+
+    // TODO: set all the handlers for this connection.
+    ngx_connection_t *c = pc->connection;
+    c->log = event->log;
+    c->sendfile = 0;
+    c->read->log = c->log;
+    c->write->log = c->log;
+    c->idle = 1;
+    c->write->handler = ngx_http_acme_ev_set_servers_send_handler;
+    c->read->handler = ngx_http_acme_ev_set_servers_recv_handler;
+
+    acme_ctx->acme_conn = c;
+
+    if (rc == NGX_OK)
+    {
+        c->write->handler(c->write);
+    }
+}
+
+static void ngx_http_acme_ev_set_servers_send_handler(ngx_event_t *event)
+{
+    ssize_t size = 0;
+
+    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_set_servers_send_handler");
+
+    // TODO: ngx_pagesize might not be big enough to fit set_servers_request.
+    u_char request[ngx_pagesize];
+    ngx_memzero(request, ngx_pagesize);
+
+    ngx_sprintf(request, "POST /set-servers HTTP/1.0\r\nAccept: */*\r\n"
+                         "Content-Type: application/json\r\n"
+                         "Content-Length: %d\r\n\r\n%s",
+                strlen(acme_ctx->set_servers_request),
+                acme_ctx->set_servers_request);
+
+    acme_ctx->send.pos = request;
+    acme_ctx->send.last = acme_ctx->send.pos + ngx_strlen(request);
+    while (acme_ctx->send.pos < acme_ctx->send.last)
+    {
+        size = acme_ctx->acme_conn->send(
+            acme_ctx->acme_conn, acme_ctx->send.pos, acme_ctx->send.last - acme_ctx->send.pos);
+
+        if (size > 0)
+        {
+            acme_ctx->send.pos += size;
+        }
+        else if (size == 0 || size == NGX_AGAIN)
+        {
+            return;
+        }
+        else
+        {
+            acme_ctx->acme_conn->error = 1;
+            return;
+        }
+    }
+
+    acme_ctx->acme_conn->write->handler = ngx_http_acme_ev_empty_handler;
+
+    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_set_servers_send_handler");
+}
+
+static void ngx_http_acme_ev_set_servers_recv_handler(ngx_event_t *event)
+{
+    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_set_servers_recv_handler");
+    acme_ctx->acme_conn->read->handler = ngx_http_acme_ev_empty_handler;
+    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_set_servers_recv_handler");
+}
+
+static void ngx_http_acme_ev_empty_handler(ngx_event_t *event)
+{
+    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_empty_handler");
+    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_empty_handler");
 }
 
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool)
