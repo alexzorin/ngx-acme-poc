@@ -11,7 +11,7 @@ typedef struct
     ngx_str_t cert;
     ngx_str_t cert_key;
 
-    char *set_servers_request;
+    ngx_str_t set_servers;
 
     ngx_event_t acme_ev;
     ngx_peer_connection_t acme_pc;
@@ -248,10 +248,11 @@ ngx_http_acme_postconfiguration(ngx_conf_t *cf)
     // and store it as a JSON string that workers will use to initialize the
     // ACME client to the state of the server configuration.
     ngx_http_core_main_conf_t *cmcf;
-    ngx_uint_t i, j;
+    ngx_uint_t i, j, set_servers_len;
     ngx_http_core_srv_conf_t **cscfp;
     ngx_http_core_srv_conf_t *cscf;
     ngx_http_server_name_t *name;
+    char *set_servers;
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
     cscfp = cmcf->servers.elts;
@@ -278,8 +279,25 @@ ngx_http_acme_postconfiguration(ngx_conf_t *cf)
         cJSON_AddItemToArray(json_servers_array, json_server);
     }
 
-    acme_ctx->set_servers_request = cJSON_Print(json_root);
+    set_servers = (char *)cJSON_Print(json_root);
     cJSON_Delete(json_root);
+
+    set_servers_len = ((strlen(set_servers) + ngx_pagesize - 1) / ngx_pagesize) * ngx_pagesize;
+    acme_ctx->set_servers.len = set_servers_len;
+    acme_ctx->set_servers.data = ngx_pcalloc(cf->pool, set_servers_len);
+    if (acme_ctx->set_servers.data == NULL)
+    {
+        return NGX_ERROR;
+    }
+    ngx_sprintf(
+        acme_ctx->set_servers.data,
+        "POST /set-servers HTTP/1.0\r\nAccept: */*\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n\r\n%s\0",
+        strlen(set_servers),
+        set_servers);
+    free(set_servers);
+    acme_ctx->set_servers.len = strlen((char *)acme_ctx->set_servers.data);
 
     // Also initialize some other static data we'll be using
     ngx_memzero(&acme_ctx->acme_addr, sizeof(acme_ctx->acme_addr));
@@ -412,18 +430,8 @@ static void ngx_http_acme_ev_set_servers_send_handler(ngx_event_t *event)
 
     ngx_log_error(NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_set_servers_send_handler");
 
-    // TODO: ngx_pagesize might not be big enough to fit set_servers_request.
-    u_char request[ngx_pagesize];
-    ngx_memzero(request, ngx_pagesize);
-
-    ngx_sprintf(request, "POST /set-servers HTTP/1.0\r\nAccept: */*\r\n"
-                         "Content-Type: application/json\r\n"
-                         "Content-Length: %d\r\n\r\n%s",
-                strlen(acme_ctx->set_servers_request),
-                acme_ctx->set_servers_request);
-
-    acme_ctx->send.pos = request;
-    acme_ctx->send.last = acme_ctx->send.pos + ngx_strlen(request);
+    acme_ctx->send.pos = (u_char *)acme_ctx->set_servers.data;
+    acme_ctx->send.last = acme_ctx->send.pos + acme_ctx->set_servers.len;
     while (acme_ctx->send.pos < acme_ctx->send.last)
     {
         size = acme_ctx->acme_conn->send(
@@ -451,7 +459,61 @@ static void ngx_http_acme_ev_set_servers_send_handler(ngx_event_t *event)
 
 static void ngx_http_acme_ev_set_servers_recv_handler(ngx_event_t *event)
 {
+    ssize_t n, size;
+    u_char *resized_buf;
+
     ngx_log_error(NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_set_servers_recv_handler");
+
+    ngx_buf_t *recv = &acme_ctx->recv;
+    recv->start = ngx_pcalloc(acme_ctx->pool, ngx_pagesize);
+    if (recv->start == NULL)
+    {
+        ngx_log_error(NGX_LOG_ERR, event->log, 0, "ngx_pcalloc failed");
+        return;
+    }
+    recv->last = recv->pos = recv->start;
+    recv->end = recv->start + ngx_pagesize;
+
+    while (1)
+    {
+        n = recv->end - recv->last;
+        if (n == 0)
+        {
+            size = recv->end - recv->start;
+            resized_buf = ngx_pcalloc(acme_ctx->pool, size * 2);
+            if (resized_buf == NULL)
+            {
+                ngx_log_error(NGX_LOG_ERR, event->log, 0, "ngx_pcalloc failed");
+                return;
+            }
+            ngx_memcpy(resized_buf, recv->start, size);
+            recv->pos = recv->start = resized_buf;
+            recv->last = resized_buf + size;
+            recv->end = resized_buf + size * 2;
+            n = recv->end - recv->last;
+        }
+
+        size = acme_ctx->acme_conn->recv(acme_ctx->acme_conn, recv->last, n);
+        if (size > 0)
+        {
+            recv->last += size;
+        }
+        else if (size == 0)
+        {
+            break;
+        }
+        else if (size == NGX_AGAIN)
+        {
+            return;
+        }
+        else
+        {
+            acme_ctx->acme_conn->error = 1;
+            ngx_log_error(NGX_LOG_ERR, event->log, 0, "Ext ngx_http_acme_ev_set_servers_recv_handler in error");
+            return;
+        }
+    }
+
     acme_ctx->acme_conn->read->handler = ngx_http_acme_ev_empty_handler;
     ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_set_servers_recv_handler");
 }
