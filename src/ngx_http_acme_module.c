@@ -414,15 +414,11 @@ static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle)
     // 2. Get the available set of certificates that we can use in this worker.
     //
     // We will use the nginx event loop to perform the work.
-    ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "Enter ngx_http_acme_init_process");
-
     acme_ctx->pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, ngx_cycle->log);
     acme_ctx->log = ngx_cycle->log;
 
     ngx_http_acme_init_parser();
     ngx_http_acme_init_events();
-
-    ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "Exit ngx_http_acme_init_process");
 
     return NGX_OK;
 }
@@ -464,7 +460,6 @@ static void ngx_http_acme_init_event(ngx_http_acme_request_t *req, const char *n
 
 static void ngx_http_acme_ev_begin(ngx_event_t *event)
 {
-    ngx_log_error(NGX_LOG_ERR, event->log, 0, "ngx_http_acme_ev_begin");
     // This is the first event in the ACME client workflow.
     // We will bring up the connection to the ACME client.
     ngx_http_acme_request_t *req = (ngx_http_acme_request_t *)event->data;
@@ -516,9 +511,6 @@ static void ngx_http_acme_ev_request_send_handler(ngx_event_t *event)
     send = &req->send;
     size = 0;
 
-    ngx_log_error(
-        NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_request_send_handler (%s)", req->name);
-
     send->pos = (u_char *)req->body.data;
     send->last = send->pos + req->body.len;
     while (send->pos < send->last)
@@ -542,9 +534,6 @@ static void ngx_http_acme_ev_request_send_handler(ngx_event_t *event)
     }
 
     c->write->handler = ngx_http_acme_ev_empty_handler;
-
-    ngx_log_error(
-        NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_request_send_handler (%s)", req->name);
 }
 
 // Receive the HTTP response, pass it on the the parser, and optionally the callback.
@@ -558,9 +547,6 @@ static void ngx_http_acme_ev_request_recv_handler(ngx_event_t *event)
 
     c = (ngx_connection_t *)event->data;
     req = (ngx_http_acme_request_t *)c->data;
-
-    ngx_log_error(
-        NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_request_recv_handler (%s)", req->name);
 
     recv = &req->recv;
     if (recv->start == NULL)
@@ -625,9 +611,6 @@ static void ngx_http_acme_ev_request_recv_handler(ngx_event_t *event)
     c->read->handler = ngx_http_acme_ev_empty_handler;
 
     // TODO: we may want to relaunch this work, if it is configured as recurring.
-
-    ngx_log_error(
-        NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_request_recv_handler (%s)", req->name);
 }
 
 static void ngx_http_acme_ev_empty_handler(ngx_event_t *event)
@@ -645,30 +628,12 @@ static void ngx_http_acme_init_parser()
 
 static int ngx_http_acme_http_on_message_complete(llhttp_t *http)
 {
-    ngx_http_acme_request_t *req = (ngx_http_acme_request_t *)http->data;
-    ngx_log_error(
-        NGX_LOG_ERR, acme_ctx->log, 0, "Enter ngx_http_acme_http_on_message_complete (%s)", req->name);
-
-    if (req == &acme_ctx->set_servers_req)
-    {
-        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "POST /set-servers response: %d",
-                      acme_ctx->parser.status_code);
-        return 0;
-    }
-    else if (req == &acme_ctx->get_certs_req)
-    {
-        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "GET /certificates response: %d",
-                      acme_ctx->parser.status_code);
-        return 0;
-    }
     return 0;
 }
 
 // Buffers up the HTTP response body (not including headers) into the request's resp_body buffer.
 static int ngx_http_acme_on_body(llhttp_t *http, const char *at, size_t length)
 {
-    ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Enter ngx_http_acme_on_body");
-
     ngx_http_acme_request_t *req = (ngx_http_acme_request_t *)http->data;
     ngx_buf_t *b = &req->resp_body;
 
@@ -686,8 +651,6 @@ static int ngx_http_acme_on_body(llhttp_t *http, const char *at, size_t length)
 // Takes a raw HTTP response (stored in the request's recv buffer) and invokes the HTTP parser.
 static void ngx_http_acme_parse_http_response(ngx_http_acme_request_t *req)
 {
-    ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Enter ngx_http_acme_parse_http_response (%s)", req->name);
-
     char *buf;
     enum llhttp_errno err;
 
@@ -702,8 +665,6 @@ static void ngx_http_acme_parse_http_response(ngx_http_acme_request_t *req)
         ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "llhttp_execute failed: %s", llhttp_errno_name(err));
         return;
     }
-    ngx_log_error(
-        NGX_LOG_ERR, acme_ctx->log, 0, "Exit ngx_http_acme_parse_http_response (%s)", req->name);
 }
 
 // Initializes the HTTP requests that we will need to send off during the lifecycle of
@@ -756,7 +717,7 @@ static ngx_int_t ngx_http_acme_init_acme_requests(ngx_pool_t *pool, char *server
 static void ngx_http_acme_process_certificates_response(void *udata)
 {
     ngx_http_acme_request_t *req;
-    char *certs_json, *domain;
+    char *certs_json;
     cJSON *json, *json_certs, *json_domain, *json_cert, *json_cert_key;
     ngx_http_acme_certs_hash *certs;
     ngx_http_acme_cert_and_key *cert;
@@ -774,6 +735,7 @@ static void ngx_http_acme_process_certificates_response(void *udata)
     if (!json_certs)
     {
         ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "certificates JSON item missing");
+        cJSON_free(json);
         return;
     }
     cJSON_ArrayForEach(json_domain, json_certs)
@@ -782,39 +744,54 @@ static void ngx_http_acme_process_certificates_response(void *udata)
         {
             continue;
         }
+        if (cJSON_GetArraySize(json_domain) != 2)
+        {
+            ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0,
+                          "Invalid certificate entry for %s", json_domain->string);
+            continue;
+        }
 
-        domain = strdup(json_domain->string);
         json_cert = cJSON_GetArrayItem(json_domain, 0);
         json_cert_key = cJSON_GetArrayItem(json_domain, 1);
 
-        cert = ngx_pcalloc(acme_ctx->pool, sizeof(ngx_http_acme_cert_and_key));
-        if (!cert)
+        // If an entry doesn't exist, allocate it and add it.
+        HASH_FIND_STR(acme_ctx->certs, json_domain->string, certs);
+        if (certs == NULL)
         {
-            ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Failed to allocate memory for ngx_http_acme_cert_and_key");
-            continue;
-        }
-        cert->cert = (u_char *)strdup(json_cert->valuestring);
-        cert->cert_key = (u_char *)strdup(json_cert_key->valuestring);
+            certs = ngx_pcalloc(acme_ctx->pool, sizeof(ngx_http_acme_certs_hash));
+            if (!certs)
+            {
+                ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0,
+                              "Failed to allocate memory for ngx_http_acme_certs_hash");
+                continue;
+            }
+            certs->server_name = strdup(json_domain->string); // We never free this.
 
-        certs = ngx_pcalloc(acme_ctx->pool, sizeof(ngx_http_acme_certs_hash));
-        if (!certs)
+            cert = ngx_pcalloc(acme_ctx->pool, sizeof(ngx_http_acme_cert_and_key));
+            if (!cert)
+            {
+                ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0,
+                              "Failed to allocate memory for ngx_http_acme_cert_and_key");
+                continue;
+            }
+
+            cert->cert = (u_char *)strdup(json_cert->valuestring);
+            cert->cert_key = (u_char *)strdup(json_cert_key->valuestring);
+
+            certs->value = cert;
+
+            HASH_ADD_KEYPTR(hh, acme_ctx->certs, certs->server_name, strlen(certs->server_name), certs);
+        }
+        // Otherwise just update the cert and cert key of the existing entry.
+        else
         {
-            ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Failed to allocate memory for ngx_http_acme_certs_hash");
-            continue;
+            free(certs->value->cert);
+            free(certs->value->cert_key);
+            certs->value->cert = (u_char *)strdup(json_cert->valuestring);
+            certs->value->cert_key = (u_char *)strdup(json_cert_key->valuestring);
         }
-        certs->server_name = domain;
-        certs->value = cert;
-
-        HASH_ADD_KEYPTR(hh, acme_ctx->certs, certs->server_name, strlen(certs->server_name), certs);
     }
-
     cJSON_free(json);
-
-    ngx_http_acme_certs_hash *s;
-    for (s = acme_ctx->certs; s != NULL; s = s->hh.next)
-    {
-        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "domain %s: cert %s", s->server_name, ((ngx_http_acme_cert_and_key *)s->value)->cert);
-    }
 }
 
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool)
