@@ -6,6 +6,9 @@
 #include "llhttp/llhttp.h"
 #include "uthash.h"
 
+#define NGX_HTTP_ACME_EV_RETRY_DELAY 1000
+#define NGX_HTTP_ACME_CERT_POLLING_INTERVAL 5000
+
 // Callback type for when a request to the ACME client is complete.
 typedef void (*ngx_http_acme_request_parse_pt)(void *data);
 
@@ -89,7 +92,8 @@ static void ngx_http_acme_ev_begin(ngx_event_t *event);
 static void ngx_http_acme_ev_request_send_handler(ngx_event_t *event);
 static void ngx_http_acme_ev_request_recv_handler(ngx_event_t *event);
 static void ngx_http_acme_ev_empty_handler(ngx_event_t *event);
-static void ngx_http_acme_ev_reset(ngx_http_acme_request_t *req);
+static void ngx_http_acme_ev_restart(ngx_http_acme_request_t *req, ngx_uint_t delay);
+static void ngx_http_acme_ev_reset(ngx_http_acme_request_t *req, ngx_uint_t delay);
 
 static int ngx_http_acme_on_body(llhttp_t *http, const char *at, size_t length);
 static int ngx_http_acme_http_on_message_complete(llhttp_t *http);
@@ -436,7 +440,7 @@ static void ngx_http_acme_init_events()
     // the ACME client to this nginx worker.
     ngx_http_acme_init_event(&acme_ctx->get_certs_req, "GET /certificates",
                              ngx_http_acme_process_certificates_response,
-                             5000);
+                             NGX_HTTP_ACME_CERT_POLLING_INTERVAL);
 }
 
 // Initializes the ngx_http_acme_request_t and fires it off immediately using a timer.
@@ -490,7 +494,7 @@ static void ngx_http_acme_ev_begin(ngx_event_t *event)
     int rc = ngx_event_connect_peer(pc);
     if (rc == NGX_ERROR || rc == NGX_DECLINED)
     {
-        ngx_http_acme_ev_reset(req);
+        ngx_http_acme_ev_reset(req, NGX_HTTP_ACME_EV_RETRY_DELAY);
         return;
     }
 
@@ -549,7 +553,7 @@ static void ngx_http_acme_ev_request_send_handler(ngx_event_t *event)
     return;
 
 send_fail:
-    ngx_http_acme_ev_reset(req);
+    ngx_http_acme_ev_reset(req, NGX_HTTP_ACME_EV_RETRY_DELAY);
 }
 
 // Receive the HTTP response, pass it on the the parser, and optionally the callback.
@@ -626,13 +630,17 @@ static void ngx_http_acme_ev_request_recv_handler(ngx_event_t *event)
 
     c->read->handler = ngx_http_acme_ev_empty_handler;
 
-    // TODO: we may want to relaunch this work, if it is configured as recurring.
+    // Relaunch this work, if it is configured as recurring.
+    if (req->interval_msec > 0)
+    {
+        ngx_http_acme_ev_restart(req, req->interval_msec);
+    }
 
     return;
 
 recv_fail:
     ngx_log_error(NGX_LOG_ERR, event->log, 0, "ngx_http_acme_ev_request_recv_handler failed");
-    ngx_http_acme_ev_reset(req);
+    ngx_http_acme_ev_reset(req, NGX_HTTP_ACME_EV_RETRY_DELAY);
 }
 
 static void ngx_http_acme_ev_empty_handler(ngx_event_t *event)
@@ -836,8 +844,8 @@ static void ngx_http_acme_process_certificates_response(void *udata)
 }
 
 // ngx_http_acme_ev_reset is called when an error occurs during the request. It will
-// clear its state and immediately relaunch the request.
-static void ngx_http_acme_ev_reset(ngx_http_acme_request_t *req)
+// completely reset its state and relaunch the event after `delay` msecs.
+static void ngx_http_acme_ev_reset(ngx_http_acme_request_t *req, ngx_uint_t delay)
 {
     if (req->pc.connection != NULL)
     {
@@ -851,10 +859,16 @@ static void ngx_http_acme_ev_reset(ngx_http_acme_request_t *req)
         req->pool = NULL;
     }
 
+    ngx_http_acme_ev_restart(req, delay);
+}
+
+// ngx_http_acme_ev_restart will restart an event without fully resetting its state
+// (i.e. it will keep the same pool and reuse existing connections).
+static void ngx_http_acme_ev_restart(ngx_http_acme_request_t *req, ngx_uint_t delay)
+{
     req->recv.start = NULL;
     req->resp_body.start = NULL;
-
-    ngx_add_timer(&req->ev, 1000);
+    ngx_add_timer(&req->ev, delay);
 }
 
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool)
