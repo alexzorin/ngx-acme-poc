@@ -4,82 +4,100 @@
 #include <ngx_event_connect.h>
 #include "cJSON.h"
 #include "llhttp/llhttp.h"
+#include "uthash.h"
 
+// Callback type for when a request to the ACME client is complete.
+typedef void (*ngx_http_acme_request_parse_pt)(void *data);
+
+// Stores the PEM representation of the certificate and certificate private key.
+typedef struct
+{
+    u_char *cert;
+    u_char *cert_key;
+} ngx_http_acme_cert_and_key;
+
+// uthash hashtable storing server_name against a certificate and private key.
+typedef struct
+{
+    char *server_name;
+    ngx_http_acme_cert_and_key *value;
+    UT_hash_handle hh;
+} ngx_http_acme_certs_hash;
+
+// ngx_http_acme_request_t encapsulates work we do with the ACME client (e.g. /set-servers request).
+typedef struct
+{
+    u_char name[64];                         // For logging.
+    ngx_str_t body;                          // The HTTP request body to send for this ACME request type
+    ngx_http_acme_request_parse_pt callback; // Callback to invoke when the request is complete.
+    ngx_event_t ev;                          // The event (timer) used to perform this request.
+    struct sockaddr_in addr;                 // Dial adderss for the ACME client.
+    ngx_peer_connection_t pc;                // The connection to the ACME client.
+    ngx_buf_t recv;                          // Request recieve buffer.
+    ngx_buf_t send;                          // Request send buffer.
+    ngx_buf_t resp_body;                     // Used for buffering the HTTP response body when it is received.
+} ngx_http_acme_request_t;
+
+// ngx_http_acme_conf_t is the global context for this module.
 typedef struct
 {
     ngx_pool_t *pool; // Memory allocator we'll use for the module (available after worker init)
     ngx_log_t *log;   // Logger for the module
 
-    ngx_str_t cert;     // Temporary storage for the certificate from the ACME client
-    ngx_str_t cert_key; // Temporary storage for the certificate key from the ACME client
+    ngx_http_acme_certs_hash *certs; // Hash table of certificates and keys for each server name
 
-    ngx_str_t set_servers; // The HTTP request body to send to the ACME client to /set-servers
-    ngx_str_t get_certs;   // The HTTP request body to the ACME client for /certificates
-
-    ngx_str_t *current_request; // The request type we're working on (set_servers or get_certs)
-
-    ngx_connection_t dummy_conn; // Required by ngx_add_timer
-
-    ngx_event_t acme_ev; // The event that triggers talking to the ACME client (timer)
+    ngx_http_acme_request_t set_servers_req; // The POST /set-servers work
+    ngx_http_acme_request_t get_certs_req;   // The GET /certificates work
 
     llhttp_settings_t parser_settings; // HTTP parser settings
     llhttp_t parser;                   // The HTTP parser for talking to the ACME client
-
-    struct sockaddr_in acme_addr;  // The address we dial to talk to the ACME client
-    ngx_peer_connection_t acme_pc; // The connection to the ACME client
-    ngx_connection_t *acme_conn;   // acme->pc.connection
-    ngx_buf_t send;                // The write buffer for acme_conn
-    ngx_buf_t recv;                // The read buffer for acme_conn
 } ngx_http_acme_conf_t;
 
+// The module context is available statically globally for convenience.
 static ngx_http_acme_conf_t *acme_ctx = NULL;
 
-static ngx_int_t ngx_http_acme_preconfiguration(ngx_conf_t *cf);
 static void *ngx_http_acme_create_conf(ngx_conf_t *cf);
 static char *ngx_http_acme_init_conf(ngx_conf_t *cf, void *conf);
-static char *ngx_http_acme(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void ngx_http_acme_cleanup(void *data);
+
+static ngx_int_t ngx_http_acme_preconfiguration(ngx_conf_t *cf);
 static ngx_int_t ngx_http_acme_postconfiguration(ngx_conf_t *cf);
+static ngx_int_t ngx_http_acme_add_variables(ngx_conf_t *cf);
+
+static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle);
+static void ngx_http_acme_init_parser();
+static ngx_int_t ngx_http_acme_init_acme_requests(ngx_pool_t *pool, char *servers_json);
+static void ngx_http_acme_init_events();
+static void ngx_http_acme_init_event(ngx_http_acme_request_t *req, const char *name,
+                                     ngx_http_acme_request_parse_pt callback);
+
+// The 'acme on'; directive.
+static char *ngx_http_acme(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+
 static ngx_str_t nginx_acme_cert_var_name = ngx_string("acme_certificate");
 static ngx_str_t nginx_acme_cert_key_var_name = ngx_string("acme_certificate_key");
-static ngx_int_t ngx_http_acme_add_variables(ngx_conf_t *cf);
 static ngx_int_t ngx_http_acme_cert_variable_get_handler(ngx_http_request_t *r,
                                                          ngx_http_variable_value_t *v,
                                                          uintptr_t data);
 static ngx_int_t ngx_http_acme_cert_key_variable_get_handler(ngx_http_request_t *r,
                                                              ngx_http_variable_value_t *v,
                                                              uintptr_t data);
-static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle);
 static void ngx_http_acme_ev_begin(ngx_event_t *event);
 static void ngx_http_acme_ev_request_send_handler(ngx_event_t *event);
 static void ngx_http_acme_ev_request_recv_handler(ngx_event_t *event);
 static void ngx_http_acme_ev_empty_handler(ngx_event_t *event);
-static void ngx_http_acme_init_parser();
-static int ngx_http_acme_http_on_message_complete(llhttp_t *http);
-static void ngx_http_acme_parse_http_response();
-cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool);
 
-// Snakeoil key and certificate is temporarily used as the default value of $acme_certificate_key
-// and $acme_certificate, respectively, before the real value is obtained from the ACME client.
-// Instead of doing this, the module potentially block the configuration process until the values
-// are bootstrapped.
-static const char SNAKEOIL_KEY[] = "-----BEGIN EC PRIVATE KEY-----\n"
-                                   "MHcCAQEEICPT+ahCJ7N6tXzpWFHiCiHWF/gEcjNc6/GUdSFi0YV0oAoGCCqGSM49\n"
-                                   "AwEHoUQDQgAELPBER10XsjGV35+p0cKdLLkMaY8+QEsEVb6+h3Mz1vufmGKj34y9\n"
-                                   "rZtdfM+uyoSSt6aRGwHkQ4C9XJadHIbcSg==\n"
-                                   "-----END EC PRIVATE KEY-----";
-static const char SNAKEOIL_CERT[] = "-----BEGIN CERTIFICATE-----\n"
-                                    "MIIBLTCB1AIJAJBSUn/gBmZkMAoGCCqGSM49BAMCMB8xHTAbBgNVBAMMFHNuYWtl\n"
-                                    "b2lsLmV4YW1wbGUuY29tMB4XDTIzMDUyNTAyNTQzNVoXDTI0MDUyNDAyNTQzNVow\n"
-                                    "HzEdMBsGA1UEAwwUc25ha2VvaWwuZXhhbXBsZS5jb20wWTATBgcqhkjOPQIBBggq\n"
-                                    "hkjOPQMBBwNCAAQs8ERHXReyMZXfn6nRwp0suQxpjz5ASwRVvr6HczPW+5+YYqPf\n"
-                                    "jL2tm118z67KhJK3ppEbAeRDgL1clp0chtxKMAoGCCqGSM49BAMCA0gAMEUCIDUf\n"
-                                    "ag6aHpON1iQU1HrkeTJ5cr70qKciUKMoJCP/AjpJAiEA0pcb4/HlNh4vHedWV0N4\n"
-                                    "mtAFIeW9HJjyu1OBkk+olJs=\n"
-                                    "-----END CERTIFICATE-----";
+static int ngx_http_acme_on_body(llhttp_t *http, const char *at, size_t length);
+static int ngx_http_acme_http_on_message_complete(llhttp_t *http);
+static void ngx_http_acme_parse_http_response(ngx_http_acme_request_t *req);
+
+static void ngx_http_acme_process_certificates_response(void *udata);
+
+cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool);
 
 static ngx_command_t ngx_http_acme_commands[] = {
 
+    // The 'acme on;' directive opts a server block into using the module.
     {ngx_string("acme"),
      NGX_HTTP_SRV_CONF | NGX_CONF_FLAG,
      ngx_http_acme,
@@ -129,13 +147,7 @@ ngx_http_acme_create_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    conf->cert.data = (u_char *)SNAKEOIL_CERT;
-    conf->cert.len = sizeof(SNAKEOIL_CERT) - 1;
-    conf->cert_key.data = (u_char *)SNAKEOIL_KEY;
-    conf->cert_key.len = sizeof(SNAKEOIL_KEY) - 1;
-
-    // We need this dummy connection to be able to use ngx_add_timer.
-    conf->dummy_conn.fd = (ngx_socket_t)-1;
+    conf->certs = NULL; // uthash requires this to be initialized to NULL.
 
     cln = ngx_pool_cleanup_add(cf->pool, 0);
     if (cln == NULL)
@@ -256,7 +268,7 @@ ngx_http_acme_postconfiguration(ngx_conf_t *cf)
     // and store it as a JSON string that workers will use to initialize the
     // ACME client to the state of the server configuration.
     ngx_http_core_main_conf_t *cmcf;
-    ngx_uint_t i, j, set_servers_len;
+    ngx_uint_t i, j;
     ngx_http_core_srv_conf_t **cscfp;
     ngx_http_core_srv_conf_t *cscf;
     ngx_http_server_name_t *name;
@@ -290,42 +302,12 @@ ngx_http_acme_postconfiguration(ngx_conf_t *cf)
     set_servers = (char *)cJSON_Print(json_root);
     cJSON_Delete(json_root);
 
-    // Set up the POST /set-servers request
-    set_servers_len = ((strlen(set_servers) + ngx_pagesize - 1) / ngx_pagesize) * ngx_pagesize;
-    acme_ctx->set_servers.len = set_servers_len;
-    acme_ctx->set_servers.data = ngx_pcalloc(cf->pool, set_servers_len);
-    if (acme_ctx->set_servers.data == NULL)
+    // Initialize the ACME client requests
+    if (ngx_http_acme_init_acme_requests(cf->pool, set_servers) != NGX_OK)
     {
         return NGX_ERROR;
     }
-    ngx_sprintf(
-        acme_ctx->set_servers.data,
-        "POST /set-servers HTTP/1.0\r\nAccept: */*\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: %d\r\n\r\n%s\0",
-        strlen(set_servers),
-        set_servers);
     free(set_servers);
-    acme_ctx->set_servers.len = strlen((char *)acme_ctx->set_servers.data);
-
-    // Set up the GET /certificates request
-    acme_ctx->get_certs.len = ngx_pagesize;
-    acme_ctx->get_certs.data = ngx_pcalloc(cf->pool, acme_ctx->get_certs.len);
-    if (acme_ctx->get_certs.data == NULL)
-    {
-        return NGX_ERROR;
-    }
-    ngx_sprintf(acme_ctx->get_certs.data,
-                "GET /certificates HTTP/1.0\r\nAccept: application/json\r\n\r\n");
-
-    // Also initialize some other static data we'll be using
-    ngx_memzero(&acme_ctx->parser, sizeof(llhttp_t));
-    ngx_memzero(&acme_ctx->acme_addr, sizeof(acme_ctx->acme_addr));
-    acme_ctx->acme_addr.sin_family = AF_INET;
-    acme_ctx->acme_addr.sin_port = htons(41934);
-    acme_ctx->acme_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    acme_ctx->current_request = &acme_ctx->set_servers;
 
     return NGX_OK;
 }
@@ -355,25 +337,70 @@ static ngx_int_t ngx_http_acme_add_variables(ngx_conf_t *cf)
     return NGX_OK;
 }
 
+// The 'get' handler for $acme_certificate. It looks up the server_name from the request
+// scope, then tries to find a matching certificate in the certs uthash. If it can't find
+// one, an empty value is returned, and the SSL handshake will fail.
 static ngx_int_t
 ngx_http_acme_cert_variable_get_handler(ngx_http_request_t *r, ngx_http_variable_value_t *v,
                                         uintptr_t data)
 {
-    v->data = acme_ctx->cert.data;
+    ngx_http_core_srv_conf_t *srv_conf;
+    ngx_http_acme_certs_hash *cert = NULL;
+
+    srv_conf = ngx_http_get_module_srv_conf(r, ngx_http_core_module);
+
+    // srv_conf->server_name is not null-terminated, so we need to copy it before we can
+    // look it up in the hash.
+    char server_name[srv_conf->server_name.len + 1];
+    strncpy(server_name, (const char *)srv_conf->server_name.data, srv_conf->server_name.len);
+    server_name[srv_conf->server_name.len] = '\0';
+
+    HASH_FIND_STR(acme_ctx->certs, (const char *)server_name, cert);
+    if (cert != NULL)
+    {
+        ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "Found cert for %s: %s", server_name, cert->value->cert);
+        v->data = cert->value->cert;
+    }
+    else
+    {
+        v->data = NULL;
+    }
+
+    v->len = strlen((const char *)v->data);
     v->no_cacheable = 1;
     v->not_found = 0;
-    v->len = acme_ctx->cert.len;
     return NGX_OK;
 }
 
+// See ngx_http_acme_cert_variable_get_handler.
 static ngx_int_t
 ngx_http_acme_cert_key_variable_get_handler(ngx_http_request_t *r, ngx_http_variable_value_t *v,
                                             uintptr_t data)
 {
-    v->data = acme_ctx->cert_key.data;
+    ngx_http_core_srv_conf_t *srv_conf;
+    ngx_http_acme_certs_hash *cert = NULL;
+
+    srv_conf = ngx_http_get_module_srv_conf(r, ngx_http_core_module);
+
+    // srv_conf->server_name is not null-terminated, so we need to copy it before we can
+    // look it up in the hash.
+    char server_name[srv_conf->server_name.len + 1];
+    strncpy(server_name, (const char *)srv_conf->server_name.data, srv_conf->server_name.len);
+    server_name[srv_conf->server_name.len] = '\0';
+
+    HASH_FIND_STR(acme_ctx->certs, (const char *)server_name, cert);
+    if (cert != NULL)
+    {
+        v->data = cert->value->cert_key;
+    }
+    else
+    {
+        v->data = NULL;
+    }
+
+    v->len = strlen((const char *)v->data);
     v->no_cacheable = 1;
     v->not_found = 0;
-    v->len = acme_ctx->cert_key.len;
     return NGX_OK;
 }
 
@@ -393,17 +420,46 @@ static ngx_int_t ngx_http_acme_init_process(ngx_cycle_t *cycle)
     acme_ctx->log = ngx_cycle->log;
 
     ngx_http_acme_init_parser();
-
-    acme_ctx->acme_ev.handler = ngx_http_acme_ev_begin;
-    acme_ctx->acme_ev.timer_set = 0;
-    acme_ctx->acme_ev.log = cycle->log;
-    acme_ctx->acme_ev.data = &acme_ctx->dummy_conn;
-
-    ngx_add_timer(&acme_ctx->acme_ev, 0);
+    ngx_http_acme_init_events();
 
     ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "Exit ngx_http_acme_init_process");
 
     return NGX_OK;
+}
+
+// ngx_http_acme_init_events fires off the background work to talk to the ACME client.
+static void ngx_http_acme_init_events()
+{
+    // Set up one request to sync the nginx server list to the ACME client
+    ngx_http_acme_init_event(&acme_ctx->set_servers_req, "POST /set-servers", NULL);
+    // Set up a second recurring request to sync the certificate list from
+    // the ACME client to this nginx worker.
+    ngx_http_acme_init_event(&acme_ctx->get_certs_req, "GET /certificates",
+                             ngx_http_acme_process_certificates_response);
+}
+
+// Initializes the ngx_http_acme_request_t and fires it off immediately using a timer.
+static void ngx_http_acme_init_event(ngx_http_acme_request_t *req, const char *name,
+                                     ngx_http_acme_request_parse_pt callback)
+{
+    ngx_uint_t buf_size = ngx_pagesize * 4;
+    ngx_buf_t *buf = &req->resp_body;
+    buf->start = ngx_pcalloc(acme_ctx->pool, buf_size);
+    if (buf->start == NULL)
+    {
+        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "ngx_pcalloc failed");
+        return;
+    }
+    buf->last = buf->pos = buf->start;
+    buf->end = buf->start + (buf_size);
+
+    ngx_sprintf(req->name, name);
+    req->ev.handler = ngx_http_acme_ev_begin;
+    req->ev.timer_set = 0;
+    req->ev.log = acme_ctx->log;
+    req->ev.data = req;
+    req->callback = callback;
+    ngx_add_timer(&req->ev, 0);
 }
 
 static void ngx_http_acme_ev_begin(ngx_event_t *event)
@@ -411,14 +467,15 @@ static void ngx_http_acme_ev_begin(ngx_event_t *event)
     ngx_log_error(NGX_LOG_ERR, event->log, 0, "ngx_http_acme_ev_begin");
     // This is the first event in the ACME client workflow.
     // We will bring up the connection to the ACME client.
+    ngx_http_acme_request_t *req = (ngx_http_acme_request_t *)event->data;
 
-    ngx_peer_connection_t *pc = &acme_ctx->acme_pc;
+    ngx_peer_connection_t *pc = &req->pc;
     pc->get = ngx_event_get_peer;
     pc->log = event->log;
     pc->log_error = NGX_ERROR_ERR;
     pc->connection = NULL;
     pc->cached = 0;
-    pc->sockaddr = (struct sockaddr *)&acme_ctx->acme_addr;
+    pc->sockaddr = (struct sockaddr *)&req->addr;
     pc->socklen = sizeof(struct sockaddr_in);
     ngx_str_t pc_name = (ngx_str_t)ngx_string("localhost");
     pc->name = &pc_name;
@@ -430,7 +487,6 @@ static void ngx_http_acme_ev_begin(ngx_event_t *event)
         return;
     }
 
-    // TODO: set all the handlers for this connection.
     ngx_connection_t *c = pc->connection;
     c->log = event->log;
     c->sendfile = 0;
@@ -439,8 +495,7 @@ static void ngx_http_acme_ev_begin(ngx_event_t *event)
     c->idle = 1;
     c->write->handler = ngx_http_acme_ev_request_send_handler;
     c->read->handler = ngx_http_acme_ev_request_recv_handler;
-
-    acme_ctx->acme_conn = c;
+    c->data = req;
 
     if (rc == NGX_OK)
     {
@@ -448,22 +503,32 @@ static void ngx_http_acme_ev_begin(ngx_event_t *event)
     }
 }
 
+// Send the HTTP request.
 static void ngx_http_acme_ev_request_send_handler(ngx_event_t *event)
 {
-    ssize_t size = 0;
+    ngx_http_acme_request_t *req;
+    ngx_connection_t *c;
+    ngx_buf_t *send;
+    ssize_t size;
 
-    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_request_send_handler");
+    c = (ngx_connection_t *)event->data;
+    req = (ngx_http_acme_request_t *)c->data;
+    send = &req->send;
+    size = 0;
 
-    acme_ctx->send.pos = (u_char *)acme_ctx->current_request->data;
-    acme_ctx->send.last = acme_ctx->send.pos + acme_ctx->current_request->len;
-    while (acme_ctx->send.pos < acme_ctx->send.last)
+    ngx_log_error(
+        NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_request_send_handler (%s)", req->name);
+
+    send->pos = (u_char *)req->body.data;
+    send->last = send->pos + req->body.len;
+    while (send->pos < send->last)
     {
-        size = acme_ctx->acme_conn->send(
-            acme_ctx->acme_conn, acme_ctx->send.pos, acme_ctx->send.last - acme_ctx->send.pos);
+        size = c->send(
+            c, send->pos, send->last - send->pos);
 
         if (size > 0)
         {
-            acme_ctx->send.pos += size;
+            send->pos += size;
         }
         else if (size == 0 || size == NGX_AGAIN)
         {
@@ -471,24 +536,33 @@ static void ngx_http_acme_ev_request_send_handler(ngx_event_t *event)
         }
         else
         {
-            acme_ctx->acme_conn->error = 1;
+            c->error = 1;
             return;
         }
     }
 
-    acme_ctx->acme_conn->write->handler = ngx_http_acme_ev_empty_handler;
+    c->write->handler = ngx_http_acme_ev_empty_handler;
 
-    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_request_send_handler");
+    ngx_log_error(
+        NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_request_send_handler (%s)", req->name);
 }
 
+// Receive the HTTP response, pass it on the the parser, and optionally the callback.
 static void ngx_http_acme_ev_request_recv_handler(ngx_event_t *event)
 {
+    ngx_connection_t *c;
+    ngx_http_acme_request_t *req;
+    ngx_buf_t *recv;
     ssize_t n, size;
     u_char *resized_buf;
 
-    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_request_recv_handler");
+    c = (ngx_connection_t *)event->data;
+    req = (ngx_http_acme_request_t *)c->data;
 
-    ngx_buf_t *recv = &acme_ctx->recv;
+    ngx_log_error(
+        NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_request_recv_handler (%s)", req->name);
+
+    recv = &req->recv;
     if (recv->start == NULL)
     {
         recv->start = ngx_pcalloc(acme_ctx->pool, ngx_pagesize);
@@ -520,7 +594,7 @@ static void ngx_http_acme_ev_request_recv_handler(ngx_event_t *event)
             n = recv->end - recv->last;
         }
 
-        size = acme_ctx->acme_conn->recv(acme_ctx->acme_conn, recv->last, n);
+        size = c->recv(c, recv->last, n);
         if (size > 0)
         {
             recv->last += size;
@@ -535,66 +609,212 @@ static void ngx_http_acme_ev_request_recv_handler(ngx_event_t *event)
         }
         else
         {
-            acme_ctx->acme_conn->error = 1;
+            c->error = 1;
             ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_request_recv_handler in error");
             return;
         }
     }
 
-    ngx_http_acme_parse_http_response();
+    ngx_http_acme_parse_http_response(req);
 
-    acme_ctx->acme_conn->read->handler = ngx_http_acme_ev_empty_handler;
-    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_request_recv_handler");
+    if (req->callback != NULL)
+    {
+        req->callback(req);
+    }
+
+    c->read->handler = ngx_http_acme_ev_empty_handler;
+
+    // TODO: we may want to relaunch this work, if it is configured as recurring.
+
+    ngx_log_error(
+        NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_request_recv_handler (%s)", req->name);
 }
 
 static void ngx_http_acme_ev_empty_handler(ngx_event_t *event)
 {
-    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Enter ngx_http_acme_ev_empty_handler");
-    ngx_log_error(NGX_LOG_ERR, event->log, 0, "Exit ngx_http_acme_ev_empty_handler");
 }
 
+// Initializes llhttp to parse our HTTP responses.
 static void ngx_http_acme_init_parser()
 {
     llhttp_settings_init(&acme_ctx->parser_settings);
     acme_ctx->parser_settings.on_message_complete = ngx_http_acme_http_on_message_complete;
+    acme_ctx->parser_settings.on_body = ngx_http_acme_on_body;
     llhttp_init(&acme_ctx->parser, HTTP_RESPONSE, &acme_ctx->parser_settings);
 }
 
 static int ngx_http_acme_http_on_message_complete(llhttp_t *http)
 {
-    ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Enter ngx_http_acme_http_on_message_complete");
+    ngx_http_acme_request_t *req = (ngx_http_acme_request_t *)http->data;
+    ngx_log_error(
+        NGX_LOG_ERR, acme_ctx->log, 0, "Enter ngx_http_acme_http_on_message_complete (%s)", req->name);
 
-    if (acme_ctx->current_request == &acme_ctx->set_servers)
+    if (req == &acme_ctx->set_servers_req)
     {
-        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "set-servers response: %d",
+        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "POST /set-servers response: %d",
                       acme_ctx->parser.status_code);
         return 0;
     }
-    else if (acme_ctx->current_request == &acme_ctx->get_certs)
+    else if (req == &acme_ctx->get_certs_req)
     {
+        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "GET /certificates response: %d",
+                      acme_ctx->parser.status_code);
         return 0;
     }
-
-    ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Exit ngx_http_acme_http_on_message_complete");
     return 0;
 }
 
-static void ngx_http_acme_parse_http_response()
+// Buffers up the HTTP response body (not including headers) into the request's resp_body buffer.
+static int ngx_http_acme_on_body(llhttp_t *http, const char *at, size_t length)
 {
-    ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Enter ngx_http_acme_parse_http_response");
+    ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Enter ngx_http_acme_on_body");
+
+    ngx_http_acme_request_t *req = (ngx_http_acme_request_t *)http->data;
+    ngx_buf_t *b = &req->resp_body;
+
+    ngx_uint_t capacity = b->end - b->last;
+    if (length > capacity)
+    {
+        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "ngx_http_acme_on_body: buffer overflow");
+        return 1;
+    }
+    ngx_memcpy(b->last, at, length);
+    b->last += length;
+    return 0;
+}
+
+// Takes a raw HTTP response (stored in the request's recv buffer) and invokes the HTTP parser.
+static void ngx_http_acme_parse_http_response(ngx_http_acme_request_t *req)
+{
+    ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Enter ngx_http_acme_parse_http_response (%s)", req->name);
 
     char *buf;
     enum llhttp_errno err;
 
-    buf = (char *)acme_ctx->recv.pos;
+    buf = (char *)req->recv.pos;
 
-    err = llhttp_execute(&acme_ctx->parser, buf, acme_ctx->recv.last - acme_ctx->recv.pos);
+    req->resp_body.last = req->resp_body.pos = req->resp_body.start; // Reset the buffer
+    llhttp_reset(&acme_ctx->parser);
+    acme_ctx->parser.data = req;
+    err = llhttp_execute(&acme_ctx->parser, buf, ngx_strlen(buf));
     if (err != HPE_OK)
     {
         ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "llhttp_execute failed: %s", llhttp_errno_name(err));
         return;
     }
-    ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Exit ngx_http_acme_parse_http_response");
+    ngx_log_error(
+        NGX_LOG_ERR, acme_ctx->log, 0, "Exit ngx_http_acme_parse_http_response (%s)", req->name);
+}
+
+// Initializes the HTTP requests that we will need to send off during the lifecycle of
+// this module.
+static ngx_int_t ngx_http_acme_init_acme_requests(ngx_pool_t *pool, char *servers_json)
+{
+    // POST /set-servers
+    ngx_http_acme_request_t *req = &acme_ctx->set_servers_req;
+    req->body.data = ngx_pcalloc(pool, ngx_pagesize);
+    req->body.len = ((strlen(servers_json) + ngx_pagesize - 1) / ngx_pagesize) * ngx_pagesize;
+    req->body.data = ngx_pcalloc(pool, req->body.len);
+    if (req->body.data == NULL)
+    {
+        return NGX_ERROR;
+    }
+    ngx_sprintf(
+        req->body.data,
+        "POST /set-servers HTTP/1.0\r\nAccept: */*\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n\r\n%s\0",
+        strlen(servers_json),
+        servers_json);
+    req->body.len = strlen((char *)req->body.data);
+    ngx_memzero(&req->addr, sizeof(req->addr));
+    req->addr.sin_family = AF_INET;
+    req->addr.sin_port = htons(41934);
+    req->addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    // GET /certificates
+    req = &acme_ctx->get_certs_req;
+    req->body.len = ngx_pagesize;
+    req->body.data = ngx_pcalloc(pool, req->body.len);
+    if (req->body.data == NULL)
+    {
+        return NGX_ERROR;
+    }
+    ngx_sprintf(req->body.data,
+                "GET /certificates HTTP/1.0\r\nAccept: application/json\r\n\r\n");
+    req->body.len = strlen((char *)req->body.data);
+    ngx_memzero(&req->addr, sizeof(req->addr));
+    req->addr.sin_family = AF_INET;
+    req->addr.sin_port = htons(41934);
+    req->addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    return NGX_OK;
+}
+
+// We have all the response from GET /certificates, so we can parse it and store it in
+// the certs hashtable, available for lookup during the SSL handshake.
+static void ngx_http_acme_process_certificates_response(void *udata)
+{
+    ngx_http_acme_request_t *req;
+    char *certs_json, *domain;
+    cJSON *json, *json_certs, *json_domain, *json_cert, *json_cert_key;
+    ngx_http_acme_certs_hash *certs;
+    ngx_http_acme_cert_and_key *cert;
+
+    req = (ngx_http_acme_request_t *)udata;
+    certs_json = (char *)req->resp_body.pos;
+
+    json = cJSON_Parse(certs_json);
+    if (!json)
+    {
+        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "JSON parse failed");
+        return;
+    }
+    json_certs = cJSON_GetObjectItemCaseSensitive(json, "certificates");
+    if (!json_certs)
+    {
+        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "certificates JSON item missing");
+        return;
+    }
+    cJSON_ArrayForEach(json_domain, json_certs)
+    {
+        if (json_domain->string == NULL)
+        {
+            continue;
+        }
+
+        domain = strdup(json_domain->string);
+        json_cert = cJSON_GetArrayItem(json_domain, 0);
+        json_cert_key = cJSON_GetArrayItem(json_domain, 1);
+
+        cert = ngx_pcalloc(acme_ctx->pool, sizeof(ngx_http_acme_cert_and_key));
+        if (!cert)
+        {
+            ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Failed to allocate memory for ngx_http_acme_cert_and_key");
+            continue;
+        }
+        cert->cert = (u_char *)strdup(json_cert->valuestring);
+        cert->cert_key = (u_char *)strdup(json_cert_key->valuestring);
+
+        certs = ngx_pcalloc(acme_ctx->pool, sizeof(ngx_http_acme_certs_hash));
+        if (!certs)
+        {
+            ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "Failed to allocate memory for ngx_http_acme_certs_hash");
+            continue;
+        }
+        certs->server_name = domain;
+        certs->value = cert;
+
+        HASH_ADD_KEYPTR(hh, acme_ctx->certs, certs->server_name, strlen(certs->server_name), certs);
+    }
+
+    cJSON_free(json);
+
+    ngx_http_acme_certs_hash *s;
+    for (s = acme_ctx->certs; s != NULL; s = s->hh.next)
+    {
+        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "domain %s: cert %s", s->server_name, ((ngx_http_acme_cert_and_key *)s->value)->cert);
+    }
 }
 
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool)

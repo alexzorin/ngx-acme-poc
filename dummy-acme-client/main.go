@@ -56,7 +56,7 @@ func handleGetCertificates(w http.ResponseWriter, r *http.Request) {
 	certs := make(map[string][2]string)
 
 	pk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	pkDER, _ := x509.MarshalECPrivateKey(pk)
+	pkDER, _ := x509.MarshalPKCS8PrivateKey(pk)
 	pkPEM := pem.EncodeToMemory(&pem.Block{
 		Type:  "PRIVATE KEY",
 		Bytes: pkDER,
