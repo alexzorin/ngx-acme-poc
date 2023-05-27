@@ -6,8 +6,8 @@ NGINX_INSTALL_DIR = $(PWD)/nginx
 
 ngx_http_acme_module.so:
 	cd $(NGINX_SRC_DIR) && \
-	./configure --prefix=$(NGINX_INSTALL_DIR) --with-cc-opt="-I/opt/homebrew/opt/pcre2/include \
-		-I/opt/homebrew/opt/openssl@1.1/include" --with-ld-opt="-L/opt/homebrew/opt/pcre2/lib \
+	./configure --prefix=$(NGINX_INSTALL_DIR) --with-cc-opt="-fsanitize=address -I/opt/homebrew/opt/pcre2/include \
+		-I/opt/homebrew/opt/openssl@1.1/include" --with-ld-opt="-fsanitize=address -L/opt/homebrew/opt/pcre2/lib \
 		-L/opt/homebrew/opt/openssl@1.1/lib" \
 		--with-compat --with-debug --with-http_addition_module --with-http_auth_request_module \
 		--with-http_degradation_module  --with-http_gunzip_module --with-http_gzip_static_module \
