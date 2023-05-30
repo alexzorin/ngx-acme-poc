@@ -109,6 +109,8 @@ static void ngx_http_acme_parse_http_response(ngx_http_acme_request_t *req);
 static void ngx_http_acme_prepare_sync_req(void *udata);
 static void ngx_http_acme_process_certificates_response(void *udata);
 
+static ngx_int_t ngx_http_acme_http_challenge_handler(ngx_http_request_t *r);
+
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool);
 
 static ngx_command_t ngx_http_acme_commands[] = {
@@ -187,7 +189,6 @@ ngx_http_acme(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_http_ssl_srv_conf_t *ssl_conf;
     ngx_http_complex_value_t *cv;
     ngx_http_compile_complex_value_t ccv;
-
     ngx_str_t *cert, *key;
 
     // The server block must be SSL-enabled.
@@ -259,6 +260,7 @@ ngx_http_acme(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     {
         return NGX_CONF_ERROR;
     }
+
     return NGX_CONF_OK;
 }
 
@@ -291,6 +293,7 @@ ngx_http_acme_postconfiguration(ngx_conf_t *cf)
     ngx_http_core_srv_conf_t *cscf;
     ngx_http_server_name_t *name;
     char *set_servers;
+    ngx_http_handler_pt *h;
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
     cscfp = cmcf->servers.elts;
@@ -327,6 +330,14 @@ ngx_http_acme_postconfiguration(ngx_conf_t *cf)
     }
     free(set_servers);
 
+    // Set up a NGX_HTTP_REWRITE_PHASE handler for /.well-known/acme-challenge requests
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_REWRITE_PHASE].handlers);
+    if (h == NULL)
+    {
+        return NGX_ERROR;
+    }
+
+    *h = ngx_http_acme_http_challenge_handler;
     return NGX_OK;
 }
 
@@ -729,6 +740,12 @@ static void ngx_http_acme_parse_http_response(ngx_http_acme_request_t *req)
         ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "llhttp_execute failed: %s", llhttp_errno_name(err));
         return;
     }
+    err = llhttp_finish(&acme_ctx->parser);
+    if (err != HPE_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "llhttp_finish failed: %s", llhttp_errno_name(err));
+        return;
+    }
 }
 
 // Initializes the HTTP requests that we will need to send off during the lifecycle of
@@ -746,9 +763,13 @@ static ngx_int_t ngx_http_acme_init_acme_requests(ngx_pool_t *pool, char *server
     }
     ngx_sprintf(
         req->body.data,
-        "POST /set-servers HTTP/1.0\r\nAccept: */*\r\n"
+        "POST /set-servers HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Accept: application/json"
         "Content-Type: application/json\r\n"
-        "Content-Length: %d\r\n\r\n%s\0",
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n%s\r\n",
         strlen(servers_json),
         servers_json);
     req->body.len = strlen((char *)req->body.data);
@@ -779,7 +800,10 @@ static void ngx_http_acme_prepare_sync_req(void *udata)
 {
     ngx_http_acme_request_t *req = (ngx_http_acme_request_t *)udata;
     ngx_snprintf(req->body.data, req->body.len,
-                 "GET /sync?since=%d HTTP/1.0\r\nAccept: application/json\r\n\r\n",
+                 "GET /sync?since=%d HTTP/1.1\r\n"
+                 "Accept: application/json\r\n"
+                 "Host: localhost\r\n"
+                 "Connection: close\r\n\r\n",
                  acme_ctx->certs_version);
     req->body.len = strlen((char *)req->body.data);
 
@@ -828,6 +852,7 @@ static void ngx_http_acme_process_certificates_response(void *udata)
         return;
     }
     acme_ctx->certs_version = json_version->valueint;
+    ngx_log_error(NGX_LOG_DEBUG, acme_ctx->log, 0, "acme certs version: %d", acme_ctx->certs_version);
 
     // thumbprint
     json_thumbprint = cJSON_GetObjectItemCaseSensitive(json, "thumbprint");
@@ -936,6 +961,60 @@ static void ngx_http_acme_ev_restart(ngx_http_acme_request_t *req, ngx_uint_t de
     req->recv.start = NULL;
     req->resp_body.start = NULL;
     ngx_add_timer(&req->ev, delay);
+}
+
+// The response handler for /.well-known/acme-challenge requests. It is configured
+// in the postconfiguration phase.
+static ngx_int_t ngx_http_acme_http_challenge_handler(ngx_http_request_t *r)
+{
+    ngx_int_t rc;
+    ngx_str_t prefix, token;
+    ngx_chain_t out;
+    ngx_buf_t *b;
+
+    if (r->method != NGX_HTTP_GET)
+    {
+        return NGX_DECLINED;
+    }
+
+    prefix = (ngx_str_t)ngx_string("/.well-known/acme-challenge/");
+    if (r->uri.len < (prefix.len + 1) || ngx_strncmp(r->uri.data, prefix.data, prefix.len) != 0)
+    {
+        return NGX_DECLINED;
+    }
+
+    token.len = r->uri.len - prefix.len;
+    token.data = r->uri.data + prefix.len;
+
+    r->headers_out.status = NGX_HTTP_OK;
+    ngx_str_set(&r->headers_out.content_type, "text/plain");
+
+    rc = ngx_http_send_header(r);
+    if (rc != NGX_OK)
+    {
+        return rc;
+    }
+
+    b = ngx_create_temp_buf(r->pool, ngx_pagesize);
+    if (b == NULL)
+    {
+        return NGX_DECLINED;
+    }
+
+    b->last = ngx_cpymem(b->last, (char *)token.data, token.len);
+    b->last = ngx_cpymem(b->last, ".", 1);
+    b->last = ngx_cpymem(b->last, (char *)acme_ctx->thumbprint,
+                         strlen((char *)acme_ctx->thumbprint));
+
+    if (r == r->main)
+    {
+        b->last_buf = 1;
+    }
+    b->last_in_chain = 1;
+    out.buf = b;
+    out.next = NULL;
+
+    return ngx_http_output_filter(r, &out);
 }
 
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool)

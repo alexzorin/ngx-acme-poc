@@ -54,7 +54,7 @@ Currently, the following is implemented:
   - [x] Receiving worker configuration
 - [ ] nginx module
   - [ ] nginx master process launches ACME client
-  - [ ] ACME HTTP challenge response
+  - [x] ACME HTTP challenge response
   - [x] Pushes config to ACME client
   - [x] Recurringly pulls certificates from ACME client
   - [x] Dynamically uses certificates from ACME client

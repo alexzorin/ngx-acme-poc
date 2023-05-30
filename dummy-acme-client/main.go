@@ -11,7 +11,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -57,6 +56,9 @@ var (
 		acmeServer       string
 		acmeContactEmail string
 	}
+
+	// Some ballast to make sure that fragmented responses work properly on the module side
+	ballast = bytes.Repeat([]byte{'q'}, 32*1024)
 
 	state clientState
 
@@ -144,6 +146,7 @@ func processSyncs() {
 			"certificates": json.RawMessage(certsJSON),
 			"thumbprint":   state.accountThumbprint(),
 			"version":      version,
+			"ballast":      ballast,
 		})
 		lastUpdateMu.Lock()
 		lastUpdate = buf
@@ -209,7 +212,7 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 
 	if response != nil {
 		w.Header().Set("content-type", "application/json")
-		io.Copy(w, bytes.NewReader(lastUpdate))
+		w.Write(lastUpdate)
 		return
 	}
 
