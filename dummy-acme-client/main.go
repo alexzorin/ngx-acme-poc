@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net/http"
 	"os"
 	"sort"
@@ -104,7 +103,6 @@ func main() {
 
 	http.HandleFunc("/set-servers", handleSetServers)
 	http.HandleFunc("/sync", handleSync)
-	http.HandleFunc("/certificates", handleGetCertificates)
 	log.Fatal(http.ListenAndServe("127.0.0.1:41934", nil))
 }
 
@@ -229,52 +227,6 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 		w.Write(response)
 	}
 
-}
-
-func handleGetCertificates(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Certificates request from %s", r.RemoteAddr)
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-
-	certs := make(map[string][2]string)
-
-	pk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	pkDER, _ := x509.MarshalPKCS8PrivateKey(pk)
-	pkPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "PRIVATE KEY",
-		Bytes: pkDER,
-	})
-
-	for _, server := range state.LastServerConfig {
-		if len(server.ServerNames) == 0 {
-			continue
-		}
-
-		tpl := &x509.Certificate{
-			SerialNumber: big.NewInt(8555),
-			DNSNames:     server.ServerNames,
-		}
-		cert, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &pk.PublicKey, pk)
-		if err != nil {
-			log.Printf("Generating certificate failed: %v", err)
-			http.Error(w, "Generating certificate failed", http.StatusInternalServerError)
-			return
-		}
-		certPEM := pem.EncodeToMemory(&pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: cert,
-		})
-		for _, serverName := range server.ServerNames {
-			certs[serverName] = [2]string{string(certPEM), string(pkPEM)}
-		}
-	}
-
-	w.Header().Set("content-type", "application/json")
-	_ = json.NewEncoder(w).Encode(struct {
-		Certificates map[string][2]string `json:"certificates"`
-	}{Certificates: certs})
 }
 
 // domainsKey produces a normalized map key for a given unsorted list of DNS names.
