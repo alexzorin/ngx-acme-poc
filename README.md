@@ -3,6 +3,8 @@
 This is an experimental proof-of-concept for an ACME (RFC8555) dynamic module for nginx. Its purpose is
 to automatically obtain and renew SSL certificates for HTTP servers.
 
+Nearly every decision taken in this project was made expeditiously, not because it was the right decision. Determining whether it was going to work at all was the goal. See the design discussion at the bottom of this document.
+
 ## How it works
 
 ![overview](./doc/components.png)
@@ -62,5 +64,41 @@ Currently, the following is implemented:
   - [ ] Allows configuring the ACME client via `acme_*` directives.
 - [ ] Build
   - [ ] `Makefile` anyone can use
-  - [ ] Build binaries against nginx.org source distributions
-  - [ ] Build binaries against Debian/Ubuntu/EPEL source distributions.
+  - [ ] Build dynamic module binaries against nginx.org source distributions
+  - [ ] Build dynamic module binaries against Debian/Ubuntu/EPEL source distributions.
+
+## Design Discussion
+
+- **Avoiding an external ACME client**
+
+  The ACME client is an external process because:
+
+  1. It can be written in a memory safe language
+  2. It doesn't need to care about the nginx event loop
+  3. It can take advantage of a mature ACME ecosystem of language XYZ (libraries, DNS plugins, etc).
+  4. Easier and faster to develop.
+
+  Plausibly, the nginx module could instead implement the ACME client itself. This would avoid having the ACME client as a sidecar process and the communication overhead that comes with it.
+
+  Significantly, this would need to be done in a way that does not block the nginx event loop, doesn't use threads, and is coordinated between nginx workers.
+
+  The runtime state of the ACME client could be stored
+  in an `ngx_shm_zone_t` with synchroized access. Workers could (randomly, staggered) try to obtain a lock on the client and perform the ACME client's work within the nginx event loop.
+
+  Life would be hard, but not impossible.
+
+- **Avoiding C: write it in Rust**
+
+  [Cloudflare's blog post](https://blog.cloudflare.com/rust-nginx-module/) suggests that writing nginx modules in Rust is possible. In my short time experimenting with [nginxinc/ngx-rust](https://github.com/nginxinc/ngx-rust), this experience leaves much to be desired. If using the Rust bindings results in essentially writing C code in Rust (constant `unsafe` FFI), the benefit is less obvious. Contributing to or waiting for the Rust bindings to mature may be needed for this to be a serious option.
+
+  With a working C prototype, rewriting this in Rust may be less miserable on a second attempt.
+
+- **Avoiding C: write some of it in Rust**
+
+  One less ambitious approach could be to write parts of the module in Rust, to be called from C. 
+
+  For example, all of the JSON and HTTP request parsing in the module is written in C and is probably unsafe in ways that are hard to detect. Offloading all of this to Rust code would be a good start.
+
+  This approach would still result in some C code (or "the Rust equivalent of C code"). With care, this could be minimized and easier to audit.
+
+  Doing this would also make implementing the ACME client within the module itself a much more reasonable prospect.
