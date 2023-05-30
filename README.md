@@ -99,6 +99,6 @@ Currently, the following is implemented:
 
   For example, all of the JSON and HTTP request parsing in the module is written in C and is probably unsafe in ways that are hard to detect. Offloading all of this to Rust code would be a good start.
 
-  This approach would still result in much C code (or "the Rust equivalent of C code"), though much will be boilerplate. With care, this could be minimized and easier to audit.
+  This approach would still result in much non-boilerplate C code (or "the Rust equivalent of C code"), owing to the fact that we still need to work within nginx's event loop and approach to networking and i/o. With care, this could be minimized and easier to audit.
 
   Doing this would also make implementing the ACME client within the module itself a much more reasonable prospect.
