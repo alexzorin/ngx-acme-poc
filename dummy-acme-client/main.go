@@ -69,9 +69,9 @@ var (
 
 	broker *updateBroker
 
-	lastUpdate   []byte
-	lastUpdateAt int64
-	lastUpdateMu sync.RWMutex
+	lastUpdate        []byte
+	lastUpdateVersion int32
+	lastUpdateMu      sync.RWMutex
 )
 
 func main() {
@@ -137,15 +137,19 @@ func updateCertificates() {
 }
 
 func processSyncs() {
+	var version int32 = 0
+
 	work := func() []byte {
+		version++
 		certsJSON := state.certificatesJSON()
 		buf, _ := json.Marshal(map[string]any{
 			"certificates": json.RawMessage(certsJSON),
 			"thumbprint":   state.accountThumbprint(),
+			"version":      version,
 		})
 		lastUpdateMu.Lock()
 		lastUpdate = buf
-		lastUpdateAt = time.Now().UnixMicro()
+		lastUpdateVersion = version
 		lastUpdateMu.Unlock()
 		return certsJSON
 	}
@@ -194,27 +198,19 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var since int64
-	if s := r.URL.Query().Get("since"); s != "" {
-		if v, err := strconv.ParseInt(s, 10, 64); err != nil {
-			since = v
-		}
-	}
-
-	w.Header().Set("content-type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	since, _ := strconv.ParseInt(r.URL.Query().Get("since"), 10, 32)
 
 	var response []byte
-
 	// If we have an update newer than the client's `since`, send a response immediately.
 	lastUpdateMu.RLock()
-	if lastUpdateAt > since {
+	if int32(since) < lastUpdateVersion {
 		response = make([]byte, len(lastUpdate))
 		copy(response, lastUpdate)
 	}
 	lastUpdateMu.RUnlock()
 
 	if response != nil {
+		w.Header().Set("content-type", "application/json")
 		io.Copy(w, bytes.NewReader(lastUpdate))
 		return
 	}
@@ -222,10 +218,17 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 	ch := broker.subscribe()
 	defer broker.unsubscribe(ch)
 
-	json.NewEncoder(w).Encode(map[string]any{
-		"certificates": json.RawMessage(<-ch),
-		"thumbprint":   acmeAccount.Thumbprint,
-	})
+	timeout := time.NewTimer(time.Minute)
+	defer timeout.Stop()
+
+	select {
+	case <-timeout.C:
+		w.WriteHeader(http.StatusNoContent)
+	case response = <-ch:
+		w.Header().Set("content-type", "application/json")
+		w.Write(response)
+	}
+
 }
 
 func handleGetCertificates(w http.ResponseWriter, r *http.Request) {

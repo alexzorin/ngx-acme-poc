@@ -12,6 +12,9 @@
 // Callback type for when a request to the ACME client is complete.
 typedef void (*ngx_http_acme_request_parse_pt)(void *data);
 
+// Callback type for preparing a request body.
+typedef void (*ngx_http_acme_prepare_request)(void *udata);
+
 // Stores the PEM representation of the certificate and certificate private key.
 typedef struct
 {
@@ -30,17 +33,19 @@ typedef struct
 // ngx_http_acme_request_t encapsulates work we do with the ACME client (e.g. /set-servers request).
 typedef struct
 {
-    u_char name[64];                         // For logging.
-    ngx_pool_t *pool;                        // Per-request pool makes this easier to dealllocate.
-    ngx_uint_t interval_msec;                // Interval between repeating this request.
-    ngx_str_t body;                          // The HTTP request body to send for this ACME request type
-    ngx_http_acme_request_parse_pt callback; // Callback to invoke when the request is complete.
-    ngx_event_t ev;                          // The event (timer) used to perform this request.
-    struct sockaddr_in addr;                 // Dial adderss for the ACME client.
-    ngx_peer_connection_t pc;                // The connection to the ACME client.
-    ngx_buf_t recv;                          // Request recieve buffer.
-    ngx_buf_t send;                          // Request send buffer.
-    ngx_buf_t resp_body;                     // Used for buffering the HTTP response body when it is received.
+    u_char name[64];                        // For logging.
+    ngx_pool_t *pool;                       // Per-request pool makes this easier to dealllocate.
+    ngx_uint_t interval_msec;               // Interval between repeating this request.
+    ngx_str_t body;                         // The HTTP request body to send for this ACME request type
+    ngx_http_acme_request_parse_pt resp_cb; // Callback to invoke when the request is complete.
+    ngx_http_acme_prepare_request req_cb;   // Callback to invoke when preparing the request body.
+    ngx_event_t ev;                         // The event (timer) used to perform this request.
+    struct sockaddr_in addr;                // Dial adderss for the ACME client.
+    ngx_peer_connection_t pc;               // The connection to the ACME client.
+    ngx_buf_t recv;                         // Request recieve buffer.
+    ngx_buf_t send;                         // Request send buffer.
+    ngx_buf_t resp_body;                    // Used for buffering the HTTP response body when it is received.
+    uint16_t resp_status_code;              // The HTTP response status code.
 } ngx_http_acme_request_t;
 
 // ngx_http_acme_conf_t is the global context for this module.
@@ -49,10 +54,12 @@ typedef struct
     ngx_pool_t *pool; // Memory allocator we'll use for the module (available after worker init)
     ngx_log_t *log;   // Logger for the module
 
+    int certs_version;               // (Server-reported) version of the last certificates sync data
     ngx_http_acme_certs_hash *certs; // Hash table of certificates and keys for each server name
+    u_char thumbprint[128];          // The (server-reported) ACME client's thumbprint
 
     ngx_http_acme_request_t set_servers_req; // The POST /set-servers work
-    ngx_http_acme_request_t get_certs_req;   // The GET /certificates work
+    ngx_http_acme_request_t sync_req;        // The GET /sync work
 
     llhttp_settings_t parser_settings; // HTTP parser settings
     llhttp_t parser;                   // The HTTP parser for talking to the ACME client
@@ -99,6 +106,7 @@ static int ngx_http_acme_on_body(llhttp_t *http, const char *at, size_t length);
 static int ngx_http_acme_http_on_message_complete(llhttp_t *http);
 static void ngx_http_acme_parse_http_response(ngx_http_acme_request_t *req);
 
+static void ngx_http_acme_prepare_sync_req(void *udata);
 static void ngx_http_acme_process_certificates_response(void *udata);
 
 cJSON *ngx_str_to_cJSON(ngx_str_t str, ngx_pool_t *pool);
@@ -156,6 +164,8 @@ ngx_http_acme_create_conf(ngx_conf_t *cf)
     }
 
     conf->certs = NULL; // uthash requires this to be initialized to NULL.
+    conf->certs_version = 0;
+    ngx_memzero(conf->thumbprint, sizeof(conf->thumbprint));
 
     cln = ngx_pool_cleanup_add(cf->pool, 0);
     if (cln == NULL)
@@ -438,9 +448,10 @@ static void ngx_http_acme_init_events()
     ngx_http_acme_init_event(&acme_ctx->set_servers_req, "POST /set-servers", NULL, 0);
     // Set up a second recurring request to sync the certificate list from
     // the ACME client to this nginx worker.
-    ngx_http_acme_init_event(&acme_ctx->get_certs_req, "GET /certificates",
+    ngx_http_acme_init_event(&acme_ctx->sync_req, "GET /sync",
                              ngx_http_acme_process_certificates_response,
                              NGX_HTTP_ACME_CERT_POLLING_INTERVAL);
+    acme_ctx->sync_req.req_cb = ngx_http_acme_prepare_sync_req;
 }
 
 // Initializes the ngx_http_acme_request_t and fires it off immediately using a timer.
@@ -461,7 +472,8 @@ static void ngx_http_acme_init_event(ngx_http_acme_request_t *req, const char *n
     req->ev.timer_set = 0;
     req->ev.log = acme_ctx->log;
     req->ev.data = req;
-    req->callback = callback;
+    req->resp_cb = callback;
+    req->req_cb = NULL;
     req->interval_msec = interval;
     ngx_add_timer(&req->ev, 0);
 }
@@ -478,6 +490,11 @@ static void ngx_http_acme_ev_begin(ngx_event_t *event)
             ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "ngx_create_pool failed");
             return;
         }
+    }
+
+    if (req->req_cb != NULL)
+    {
+        req->req_cb(req);
     }
 
     ngx_peer_connection_t *pc = &req->pc;
@@ -623,9 +640,9 @@ static void ngx_http_acme_ev_request_recv_handler(ngx_event_t *event)
 
     ngx_http_acme_parse_http_response(req);
 
-    if (req->callback != NULL)
+    if (req->resp_cb != NULL)
     {
-        req->callback(req);
+        req->resp_cb(req);
     }
 
     c->read->handler = ngx_http_acme_ev_empty_handler;
@@ -658,6 +675,8 @@ static void ngx_http_acme_init_parser()
 
 static int ngx_http_acme_http_on_message_complete(llhttp_t *http)
 {
+    ngx_http_acme_request_t *req = (ngx_http_acme_request_t *)http->data;
+    req->resp_status_code = http->status_code;
     return 0;
 }
 
@@ -738,17 +757,16 @@ static ngx_int_t ngx_http_acme_init_acme_requests(ngx_pool_t *pool, char *server
     req->addr.sin_port = htons(41934);
     req->addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    // GET /certificates
-    req = &acme_ctx->get_certs_req;
+    // GET /sync
+    req = &acme_ctx->sync_req;
     req->body.len = ngx_pagesize;
     req->body.data = ngx_pcalloc(pool, req->body.len);
     if (req->body.data == NULL)
     {
         return NGX_ERROR;
     }
-    ngx_sprintf(req->body.data,
-                "GET /certificates HTTP/1.0\r\nAccept: application/json\r\n\r\n");
-    req->body.len = strlen((char *)req->body.data);
+
+    // Dial address
     ngx_memzero(&req->addr, sizeof(req->addr));
     req->addr.sin_family = AF_INET;
     req->addr.sin_port = htons(41934);
@@ -757,25 +775,72 @@ static ngx_int_t ngx_http_acme_init_acme_requests(ngx_pool_t *pool, char *server
     return NGX_OK;
 }
 
-// We have all the response from GET /certificates, so we can parse it and store it in
+static void ngx_http_acme_prepare_sync_req(void *udata)
+{
+    ngx_http_acme_request_t *req = (ngx_http_acme_request_t *)udata;
+    ngx_snprintf(req->body.data, req->body.len,
+                 "GET /sync?since=%d HTTP/1.0\r\nAccept: application/json\r\n\r\n",
+                 acme_ctx->certs_version);
+    req->body.len = strlen((char *)req->body.data);
+
+    ngx_log_error(NGX_LOG_DEBUG, acme_ctx->log, 0, "preparing sync request for version %d",
+                  acme_ctx->certs_version);
+}
+
+// We have all the response from GET /sync, so we can parse it and store it in
 // the certs hashtable, available for lookup during the SSL handshake.
 static void ngx_http_acme_process_certificates_response(void *udata)
 {
     ngx_http_acme_request_t *req;
     char *certs_json;
-    cJSON *json, *json_certs, *json_domain, *json_cert, *json_cert_key;
+    cJSON *json, *json_certs, *json_domain, *json_cert,
+        *json_cert_key, *json_version, *json_thumbprint;
     ngx_http_acme_certs_hash *certs;
     ngx_http_acme_cert_and_key *cert;
 
     req = (ngx_http_acme_request_t *)udata;
-    certs_json = (char *)req->resp_body.pos;
+    if (req->resp_status_code == 204)
+    {
+        ngx_log_error(NGX_LOG_DEBUG, acme_ctx->log, 0, "certificates sync returned 204, no-nop");
+        return;
+    }
+    if (req->resp_status_code != 200)
+    {
+        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "certificates sync failed with status code %d",
+                      req->resp_status_code);
+        return;
+    }
 
+    certs_json = (char *)req->resp_body.pos;
     json = cJSON_Parse(certs_json);
     if (!json)
     {
         ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "JSON parse failed");
         return;
     }
+
+    // version
+    json_version = cJSON_GetObjectItemCaseSensitive(json, "version");
+    if (!json_version)
+    {
+        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "version JSON item missing");
+        cJSON_free(json);
+        return;
+    }
+    acme_ctx->certs_version = json_version->valueint;
+
+    // thumbprint
+    json_thumbprint = cJSON_GetObjectItemCaseSensitive(json, "thumbprint");
+    if (!json_thumbprint)
+    {
+        ngx_log_error(NGX_LOG_ERR, acme_ctx->log, 0, "thumbprint JSON item missing");
+        cJSON_free(json);
+        return;
+    }
+    ngx_snprintf(acme_ctx->thumbprint, sizeof(acme_ctx->thumbprint), "%s", json_thumbprint->valuestring);
+    ngx_log_error(NGX_LOG_DEBUG, acme_ctx->log, 0, "acme thumbprint: %s", acme_ctx->thumbprint);
+
+    // certificates
     json_certs = cJSON_GetObjectItemCaseSensitive(json, "certificates");
     if (!json_certs)
     {
@@ -830,6 +895,7 @@ static void ngx_http_acme_process_certificates_response(void *udata)
             certs->value = cert;
 
             HASH_ADD_KEYPTR(hh, acme_ctx->certs, certs->server_name, strlen(certs->server_name), certs);
+            ngx_log_error(NGX_LOG_DEBUG, acme_ctx->log, 0, "Added certificate for %s", certs->server_name);
         }
         // Otherwise just update the cert and cert key of the existing entry.
         else
@@ -838,6 +904,7 @@ static void ngx_http_acme_process_certificates_response(void *udata)
             free(certs->value->cert_key);
             certs->value->cert = (u_char *)strdup(json_cert->valuestring);
             certs->value->cert_key = (u_char *)strdup(json_cert_key->valuestring);
+            ngx_log_error(NGX_LOG_DEBUG, acme_ctx->log, 0, "Updated certificate for %s", certs->server_name);
         }
     }
     cJSON_free(json);
