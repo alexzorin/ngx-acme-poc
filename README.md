@@ -83,7 +83,7 @@ Currently, the following is implemented:
   Significantly, this would need to be done in a way that does not block the nginx event loop, doesn't use threads, and is coordinated between nginx workers.
 
   The runtime state of the ACME client could be stored
-  in an `ngx_shm_zone_t` with synchroized access. Workers could (randomly, staggered) try to obtain a lock on the client and perform the ACME client's work within the nginx event loop.
+  in an `ngx_shm_zone_t` with synchronized access. Workers could (randomly, staggered) try to obtain a lock on the client and perform the ACME client's work within the nginx event loop.
 
   Life would be hard, but not impossible.
 
@@ -99,6 +99,6 @@ Currently, the following is implemented:
 
   For example, all of the JSON and HTTP request parsing in the module is written in C and is probably unsafe in ways that are hard to detect. Offloading all of this to Rust code would be a good start.
 
-  This approach would still result in some C code (or "the Rust equivalent of C code"). With care, this could be minimized and easier to audit.
+  This approach would still result in much C code (or "the Rust equivalent of C code"), though much will be boilerplate. With care, this could be minimized and easier to audit.
 
   Doing this would also make implementing the ACME client within the module itself a much more reasonable prospect.
